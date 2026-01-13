@@ -6,6 +6,8 @@ idf_component_register(
     "web_server.c"
     "device_state.c"
     "matter_mgr.c"
+    "reset_btn.c"
+    "dns_server.c"
   INCLUDE_DIRS "."
   REQUIRES
     nvs_flash
@@ -14,4 +16,7 @@ idf_component_register(
     esp_netif
     esp_http_server
     freertos
+    driver
+    lwip
+    cjson
 )

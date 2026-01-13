@@ -7,6 +7,9 @@
 
 static const char *TAG = "wifi";
 
+static bool s_is_ap = false;
+bool wifi_mgr_is_ap(void) { return s_is_ap; }
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)data;
@@ -24,6 +27,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
 static esp_err_t start_ap(const cfg_t *cfg)
 {
+    s_is_ap = true;
     ESP_LOGI(TAG, "Starting AP: %s", cfg->ap_ssid);
 
     esp_netif_create_default_wifi_ap();
@@ -50,6 +54,7 @@ static esp_err_t start_ap(const cfg_t *cfg)
 
 static esp_err_t start_sta(const cfg_t *cfg)
 {
+    s_is_ap = false;
     ESP_LOGI(TAG, "Starting STA, SSID: %s", cfg->sta_ssid);
 
     esp_netif_create_default_wifi_sta();
