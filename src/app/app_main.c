@@ -1,12 +1,15 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
-#include "cfg.h"
 #include "wifi_mgr.h"
 #include "web_server.h"
-#include "device_state.h"
-#include "matter_mgr.h"
 #include "reset_btn.h"
+
+#include "cfg_json.h"
+#include "modules.h"
+
+#include "matter_mgr.h"
+#include "device_state.h"
 
 static const char *TAG = "app";
 
@@ -22,16 +25,17 @@ void app_main(void)
         ESP_ERROR_CHECK(err);
     }
 
-    cfg_t cfg;
-    cfg_load_or_default(&cfg);
+    ESP_ERROR_CHECK(cfg_json_load_or_default());
+    ESP_ERROR_CHECK(modules_init());
+    ESP_ERROR_CHECK(modules_apply_config(cfg_json_get()));
 
     device_state_init();
 
-    ESP_ERROR_CHECK(wifi_mgr_start(&cfg));
-    ESP_ERROR_CHECK(web_server_start(&cfg));
     ESP_ERROR_CHECK(reset_btn_start());
+    ESP_ERROR_CHECK(wifi_mgr_start_from_cfg(cfg_json_get()));  // ниже дам файл
+    ESP_ERROR_CHECK(web_server_start());
 
-    ESP_ERROR_CHECK(matter_mgr_start(&cfg)); // пока заглушка
+    ESP_ERROR_CHECK(matter_mgr_start(NULL)); // заглушка/потом подключим
 
     ESP_LOGI(TAG, "System started");
 }

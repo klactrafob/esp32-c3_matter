@@ -1,17 +1,11 @@
 #include "matter_mgr.h"
 #include "esp_log.h"
-#include "app_config.h"
 
-static const char *TAG = "matter";
+static const char *TAG = "matter_mgr";
 
-esp_err_t matter_mgr_start(const cfg_t *cfg)
+esp_err_t matter_mgr_start(void *unused)
 {
-    (void)cfg;
-
-#if APP_ENABLE_MATTER
-    ESP_LOGI(TAG, "Matter ENABLED (not implemented yet)");
-#else
-    ESP_LOGW(TAG, "Matter disabled (APP_ENABLE_MATTER=0). Using stub.");
-#endif
+    (void)unused;
+    ESP_LOGW(TAG, "Matter is not implemented yet (stub).");
     return ESP_OK;
 }

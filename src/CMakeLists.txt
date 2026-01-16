@@ -1,13 +1,20 @@
 idf_component_register(
   SRCS
     "app_main.c"
-    "cfg.c"
     "wifi_mgr.c"
-    "web_server.c"
-    "device_state.c"
-    "matter_mgr.c"
-    "reset_btn.c"
     "dns_server.c"
+    "web_server.c"
+    "reset_btn.c"
+
+    "cfg_json.c"
+    "modules.c"
+
+    "mod_relay.c"
+    "mod_pwm.c"
+    "mod_ws2812.c"
+
+    "matter_mgr.c"
+    "device_state.c"
   INCLUDE_DIRS "."
   REQUIRES
     nvs_flash
@@ -18,5 +25,5 @@ idf_component_register(
     freertos
     driver
     lwip
-    cjson
+    json
 )
