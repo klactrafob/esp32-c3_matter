@@ -1,7 +1,7 @@
-#include "reset_btn.h"
+#include "drivers/reset_btn.h"
 #include "app_config.h"
 
-#include "cfg_json.h"
+#include "core/cfg_json.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"

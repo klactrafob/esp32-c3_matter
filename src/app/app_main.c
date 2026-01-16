@@ -1,12 +1,12 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
-#include "wifi_mgr.h"
-#include "web_server.h"
-#include "reset_btn.h"
+#include "net/wifi_mgr.h"
+#include "net/web_server.h"
+#include "drivers/reset_btn.h"
 
-#include "cfg_json.h"
-#include "modules.h"
+#include "core/cfg_json.h"
+#include "core/modules.h"
 
 #include "matter_mgr.h"
 #include "device_state.h"

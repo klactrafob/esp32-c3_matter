@@ -1,4 +1,4 @@
-#include "dns_server.h"
+#include "net/dns_server.h"
 #include "esp_log.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"

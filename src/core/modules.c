@@ -1,10 +1,10 @@
-#include "modules.h"
+#include "core/modules.h"
 #include <string.h>
 #include "esp_log.h"
 
-#include "mod_relay.h"
-#include "mod_pwm.h"
-#include "mod_ws2812.h"
+#include "modules/relay/mod_relay.h"
+#include "modules/pwm/mod_pwm.h"
+#include "modules/ws2812/mod_ws2812.h"
 
 static const char *TAG = "modules";
 

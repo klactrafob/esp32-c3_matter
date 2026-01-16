@@ -1,4 +1,4 @@
-#include "web_server.h"
+#include "net/web_server.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -9,10 +9,10 @@
 #include "esp_system.h"
 #include "cJSON.h"
 
-#include "cfg_json.h"
-#include "modules.h"
-#include "wifi_mgr.h"
-#include "dns_server.h"
+#include "core/cfg_json.h"
+#include "core/modules.h"
+#include "net/wifi_mgr.h"
+#include "net/dns_server.h"
 #include "app_config.h"
 
 static const char *TAG = "web";
