@@ -46,8 +46,24 @@ static cJSON *make_default_cfg(void)
     cJSON_AddBoolToObject(ws, "enable", false);
     cJSON_AddNumberToObject(ws, "gpio", 8);
     cJSON_AddNumberToObject(ws, "count", 30);
+
+    // Runtime defaults (can be overridden via /api/modules/ws2812/action)
+    cJSON_AddBoolToObject(ws, "on", false);
     cJSON_AddNumberToObject(ws, "brightness", 50); // 0..100
-    cJSON_AddStringToObject(ws, "effect", "solid");
+    cJSON *rgb = cJSON_AddArrayToObject(ws, "rgb");
+    cJSON_AddItemToArray(rgb, cJSON_CreateNumber(255));
+    cJSON_AddItemToArray(rgb, cJSON_CreateNumber(255));
+    cJSON_AddItemToArray(rgb, cJSON_CreateNumber(255));
+
+    // Web UI / device config
+    cJSON_AddStringToObject(ws, "color_order", "GRB");
+    cJSON_AddNumberToObject(ws, "brightness_limit", 100); // 0..100 (%)
+    cJSON_AddNumberToObject(ws, "transition_ms", 300);
+    cJSON_AddNumberToObject(ws, "frame_ms", 20);
+
+    cJSON_AddStringToObject(ws, "power_on_effect", "fade");   // none|fade|wipe
+    cJSON_AddStringToObject(ws, "power_off_effect", "fade");  // none|fade|wipe
+    cJSON_AddNumberToObject(ws, "effect_duration_ms", 400);
 
     return root;
 }

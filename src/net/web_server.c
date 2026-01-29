@@ -26,9 +26,124 @@ static const char *INDEX_HTML =
 "<p>API:</p>"
 "<ul>"
 "<li><a href='/api/config'>/api/config</a></li>"
-"<li><a href='/api/modules'>/api/modules</a></li>"
+"<li><a href='/api/modules'>/api/modules</a></li><li><a href='/ws2812'>WS2812 settings</a></li>"
 "</ul>"
 "</body></html>";
+
+static const char *WS2812_HTML =
+"<!doctype html><html><head><meta charset='utf-8'/>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+"<title>WS2812 Settings</title>"
+"<style>"
+"body{font-family:system-ui,Arial,sans-serif;margin:16px;max-width:720px}"
+"label{display:block;margin-top:10px;font-weight:600}"
+"input,select{width:100%;padding:8px;margin-top:4px}"
+".row{display:flex;gap:12px}"
+".row>div{flex:1}"
+"button{padding:10px 14px;margin-top:14px}"
+"pre{background:#f4f4f4;padding:10px;overflow:auto}"
+"</style></head><body>"
+"<h3>WS2812 (LED Strip) settings</h3>"
+"<p>Изменения сохраняются в конфиг, затем применяется /api/apply.</p>"
+
+"<div class='row'>"
+" <div><label>Enable</label><select id='en'><option value='false'>false</option><option value='true'>true</option></select></div>"
+" <div><label>GPIO</label><input id='gpio' type='number' min='0' max='48'/></div>"
+"</div>"
+
+"<div class='row'>"
+" <div><label>LED count</label><input id='count' type='number' min='1' max='2048'/></div>"
+" <div><label>Color order</label>"
+"  <select id='order'>"
+"   <option>RGB</option><option>RBG</option><option>GRB</option><option>GBR</option><option>BRG</option><option>BGR</option>"
+"  </select>"
+" </div>"
+"</div>"
+
+"<label>Brightness limit (%)</label><input id='blim' type='number' min='0' max='100'/>"
+"<label>Transition time (ms)</label><input id='tr' type='number' min='0' max='60000'/>"
+"<label>Frame period (ms)</label><input id='frame' type='number' min='10' max='200'/>"
+
+"<div class='row'>"
+" <div><label>Power ON effect</label><select id='pon'><option>none</option><option>fade</option><option>wipe</option></select></div>"
+" <div><label>Power OFF effect</label><select id='poff'><option>none</option><option>fade</option><option>wipe</option></select></div>"
+"</div>"
+"<label>Effect duration (ms)</label><input id='edur' type='number' min='0' max='60000'/>"
+
+"<hr/>"
+"<h4>Quick action</h4>"
+"<div class='row'>"
+" <div><label>On</label><select id='act_on'><option value='false'>false</option><option value='true'>true</option></select></div>"
+" <div><label>Brightness (0..100)</label><input id='act_br' type='number' min='0' max='100'/></div>"
+"</div>"
+"<div class='row'>"
+" <div><label>R</label><input id='act_r' type='number' min='0' max='255'/></div>"
+" <div><label>G</label><input id='act_g' type='number' min='0' max='255'/></div>"
+" <div><label>B</label><input id='act_b' type='number' min='0' max='255'/></div>"
+"</div>"
+
+"<button onclick='saveCfg()'>Save config</button> "
+"<button onclick='applyNow()'>Apply config</button> "
+"<button onclick='sendAction()'>Send action</button>"
+
+"<p id='msg'></p>"
+"<pre id='dump'></pre>"
+
+"<script>"
+"const $=id=>document.getElementById(id);"
+"function msg(t){$('msg').textContent=t;}"
+"async function load(){"
+"  const cfg=await (await fetch('/api/config')).json();"
+"  const ws=((cfg.modules||{}).ws2812)||{};"
+"  $('en').value=String(!!ws.enable);"
+"  $('gpio').value=(ws.gpio===undefined?8:ws.gpio);"
+"  $('count').value=(ws.count===undefined?30:ws.count);"
+"  $('order').value=(ws.color_order||'GRB');"
+"  $('blim').value=(ws.brightness_limit===undefined?100:ws.brightness_limit);"
+"  $('tr').value=(ws.transition_ms===undefined?300:ws.transition_ms);"
+"  $('frame').value=(ws.frame_ms===undefined?20:ws.frame_ms);"
+"  $('pon').value=(ws.power_on_effect||'fade');"
+"  $('poff').value=(ws.power_off_effect||'fade');"
+"  $('edur').value=(ws.effect_duration_ms===undefined?400:ws.effect_duration_ms);"
+"  $('dump').textContent=JSON.stringify(ws,null,2);"
+"}"
+"async function saveCfg(){"
+"  const cfg=await (await fetch('/api/config')).json();"
+"  cfg.modules=cfg.modules||{}; cfg.modules.ws2812=cfg.modules.ws2812||{};"
+"  const ws=cfg.modules.ws2812;"
+"  ws.enable=$('en').value==='true';"
+"  ws.gpio=parseInt($('gpio').value||'8',10);"
+"  ws.count=parseInt($('count').value||'30',10);"
+"  ws.color_order=$('order').value;"
+"  ws.brightness_limit=parseInt($('blim').value||'100',10);"
+"  ws.transition_ms=parseInt($('tr').value||'300',10);"
+"  ws.frame_ms=parseInt($('frame').value||'20',10);"
+"  ws.power_on_effect=$('pon').value;"
+"  ws.power_off_effect=$('poff').value;"
+"  ws.effect_duration_ms=parseInt($('edur').value||'400',10);"
+"  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});"
+"  msg('Saved: '+r.status);"
+"  load();"
+"}"
+"async function applyNow(){"
+"  const r=await fetch('/api/apply',{method:'POST'});"
+"  msg('Apply: '+r.status);"
+"}"
+"async function sendAction(){"
+"  const a={"
+"    on:$('act_on').value==='true',"
+"    brightness:parseInt($('act_br').value||'50',10),"
+"    r:parseInt($('act_r').value||'255',10),"
+"    g:parseInt($('act_g').value||'255',10),"
+"    b:parseInt($('act_b').value||'255',10)"
+"  };"
+"  const r=await fetch('/api/modules/ws2812/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(a)});"
+"  const j=await r.json().catch(()=>({}));"
+"  msg('Action: '+r.status);"
+"  $('dump').textContent=JSON.stringify(j,null,2);"
+"}"
+"load();"
+"</script></body></html>";
 
 static bool captive_active(void)
 {
@@ -108,6 +223,14 @@ static esp_err_t handle_root(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
+
+static esp_err_t handle_ws2812(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, WS2812_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
 
 static esp_err_t handle_get_config(httpd_req_t *req)
 {
@@ -210,6 +333,9 @@ esp_err_t web_server_start(void)
 
     httpd_uri_t root = {.uri="/", .method=HTTP_GET, .handler=handle_root};
     httpd_register_uri_handler(s_server, &root);
+
+    httpd_uri_t ws = {.uri="/ws2812", .method=HTTP_GET, .handler=handle_ws2812};
+    httpd_register_uri_handler(s_server, &ws);
 
     httpd_uri_t get_cfg = {.uri="/api/config", .method=HTTP_GET, .handler=handle_get_config};
     httpd_register_uri_handler(s_server, &get_cfg);
