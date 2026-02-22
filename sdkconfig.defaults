@@ -1,0 +1,2 @@
+# Default target and options (apply: idf.py set-target esp32c3, or use this as defaults)
+CONFIG_IDF_TARGET="esp32c3"
