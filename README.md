@@ -32,6 +32,21 @@ idf.py -p COM4 flash monitor
 
 Переменная окружения `IDF_PATH` должна указывать на корень ESP-IDF (например, после `export.ps1` / `export.sh` из установки ESP-IDF).
 
+### Если CMake выдаёт «define_property command is not scriptable»
+
+Такое бывает с **CMake 3.30+** при разрешении зависимостей (Component Manager). Решение: использовать CMake **3.28** или **3.29**.
+
+- В системе: установи CMake 3.28/3.29 и выбери его в PATH перед запуском `idf.py build`.
+- В VS Code (расширение ESP-IDF): в настройках укажи путь к CMake 3.28 (например, `C:\Users\...\.espressif\tools\cmake\3.28.x`), если он установлен через ESP-IDF Tools.
+
+После смены версии CMake выполни заново:
+
+```bash
+idf.py fullclean
+idf.py set-target esp32c3
+idf.py build
+```
+
 ## Планируемые типы устройств
 - Реле: 1 / 2 / 3 / 4 канала
 - PWM: 1 / 2 / 3 канала (+ опциональное реле hard-off)

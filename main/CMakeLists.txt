@@ -30,5 +30,5 @@ idf_component_register(
     led_strip
 )
 
-# Optional: Matter (override via -DAPP_ENABLE_MATTER=1 or sdkconfig)
-target_compile_definitions(${COMPONENT_LIB} PRIVATE APP_ENABLE_MATTER=0)
+# Optional: Matter (override via -DAPP_ENABLE_MATTER=1)
+target_compile_definitions(${COMPONENT_LIB} PRIVATE "APP_ENABLE_MATTER=0")
