@@ -31,5 +31,4 @@ idf_component_register(
     driver
     lwip
     json
-    led_strip
 )
