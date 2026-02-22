@@ -1,0 +1,5 @@
+## IDF Component Manager Manifest File
+dependencies:
+  # LED Strip driver (RMT-based) from ESP Component Registry
+  espressif/led_strip: "^2.5.5"
+  idf: ">=5.0"
