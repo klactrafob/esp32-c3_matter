@@ -1,6 +1,10 @@
 # PlatformIO build artifacts
 .pio/
 
+# ESP-IDF Component Manager (managed components and lockfile)
+managed_components/
+dependencies.lock
+
 # VS Code
 .vscode/*
 !.vscode/launch.json

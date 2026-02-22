@@ -258,7 +258,10 @@ static void apply_action_locked(const cJSON *action)
     bool any = false;
 
     bool new_on = s_target.on;
-    if (cJSON_IsBool(on)) { new_on = cJSON_IsTrue(on); any = true; }
+    if (cJSON_IsBool(on)) {
+        new_on = cJSON_IsTrue(on);
+        any = true;
+    }
 
     if (cJSON_IsNumber(br)) {
         s_target.brightness = clamp_i(br->valueint, 0, 100);
@@ -374,15 +377,9 @@ static void update_transition_locked(void)
         if (t > 1) t = 1;
     }
 
-    // for power effects, treat wipe separately in render; but state interpolation still used
-    if (s_tr.pwr_eff == PWR_EFF_FADE) {
-        // fade: force brightness ramp; keep color moving too
-        float br = s_tr.br0 + (s_tr.br1 - s_tr.br0) * t;
-        s_state.brightness = clamp_i((int)lroundf(br * 100.0f), 0, 100);
-    } else {
-        float br = s_tr.br0 + (s_tr.br1 - s_tr.br0) * t;
-        s_state.brightness = clamp_i((int)lroundf(br * 100.0f), 0, 100);
-    }
+    // brightness and color interpolation (linear)
+    float br = s_tr.br0 + (s_tr.br1 - s_tr.br0) * t;
+    s_state.brightness = clamp_i((int)lroundf(br * 100.0f), 0, 100);
 
     s_state.r = clamp_u8((int)lroundf(s_tr.r0 + (s_tr.r1 - s_tr.r0) * t));
     s_state.g = clamp_u8((int)lroundf(s_tr.g0 + (s_tr.g1 - s_tr.g0) * t));
@@ -472,11 +469,11 @@ static esp_err_t parse_cfg(const cJSON *cfg, ws_cfg_t *out)
     if (cJSON_IsString(poff) && poff->valuestring) out->power_off_effect = parse_pwr_eff(poff->valuestring);
     if (cJSON_IsNumber(ed)) out->effect_duration_ms = ed->valueint;
 
-    out->count = clamp_i(out->count, 1, 2048);
-    out->brightness_limit = clamp_i(out->brightness_limit, 0, 100);
-    out->transition_ms = clamp_i(out->transition_ms, 0, 60000);
-    out->frame_ms = clamp_i(out->frame_ms, 10, 200);
-    out->effect_duration_ms = clamp_i(out->effect_duration_ms, 0, 60000);
+    out->count = clamp_i(out->count, 1, 1024);
+    out->brightness_limit = clamp_i(out->brightness_limit, 1, 100);
+    out->transition_ms = clamp_i(out->transition_ms, 0, 5000);
+    out->frame_ms = clamp_i(out->frame_ms, 10, 100);
+    out->effect_duration_ms = clamp_i(out->effect_duration_ms, 0, 5000);
 
     return ESP_OK;
 }
