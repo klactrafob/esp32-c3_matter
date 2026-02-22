@@ -32,10 +32,10 @@ void app_main(void)
     device_state_init();
 
     ESP_ERROR_CHECK(reset_btn_start());
-    ESP_ERROR_CHECK(wifi_mgr_start_from_cfg(cfg_json_get()));  // ниже дам файл
+    ESP_ERROR_CHECK(wifi_mgr_start_from_cfg(cfg_json_get()));
     ESP_ERROR_CHECK(web_server_start());
 
-    ESP_ERROR_CHECK(matter_mgr_start(NULL)); // заглушка/потом подключим
+    ESP_ERROR_CHECK(matter_mgr_start(NULL));
 
     ESP_LOGI(TAG, "System started");
 }
