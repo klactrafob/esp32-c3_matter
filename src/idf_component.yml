@@ -1,6 +1,0 @@
-## IDF Component Manager Manifest File
-dependencies:
-  # LED Strip driver (RMT-based) from ESP Component Registry
-  espressif/led_strip: "^2.5.5"
-  # Required ESP-IDF version (PlatformIO uses ESP-IDF 5.5.x here)
-  idf: ">=5.0"
