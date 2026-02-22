@@ -1,6 +1,6 @@
 idf_component_register(
   SRCS
-    "app/app_main.c"
+    "app_main.c"
     "core/cfg_json.c"
     "core/modules.c"
     "net/wifi_mgr.c"
