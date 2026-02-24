@@ -28,4 +28,5 @@ idf_component_register(
     lwip
     json
     led_strip
+    esp_timer
 )
