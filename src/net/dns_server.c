@@ -97,8 +97,11 @@ static void dns_task(void *arg)
     }
 
     ESP_LOGI(TAG, "DNS captive stopped");
-    close(s_sock);
-    s_sock = -1;
+    if (s_sock >= 0) {
+        close(s_sock);
+        s_sock = -1;
+    }
+    s_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -106,12 +109,16 @@ esp_err_t dns_server_start(void)
 {
     if (s_task) return ESP_OK;
     s_run = true;
-    xTaskCreate(dns_task, "dns_srv", 4096, NULL, 5, &s_task);
-    return ESP_OK;
+    BaseType_t ok = xTaskCreate(dns_task, "dns_srv", 4096, NULL, 5, &s_task);
+    return ok == pdPASS ? ESP_OK : ESP_FAIL;
 }
 
 void dns_server_stop(void)
 {
     s_run = false;
-    s_task = NULL;
+    if (s_sock >= 0) {
+        shutdown(s_sock, SHUT_RDWR);
+        close(s_sock);
+        s_sock = -1;
+    }
 }

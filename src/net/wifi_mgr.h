@@ -5,3 +5,4 @@
 
 esp_err_t wifi_mgr_start_from_cfg(const cJSON *cfg);
 bool wifi_mgr_is_ap(void);
+const char *wifi_mgr_get_ap_ssid(void);

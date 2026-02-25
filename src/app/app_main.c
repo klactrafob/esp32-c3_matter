@@ -10,6 +10,7 @@
 
 #include "matter_mgr.h"
 #include "device_state.h"
+#include "app_loop.h"
 
 static const char *TAG = "app";
 
@@ -32,10 +33,11 @@ void app_main(void)
     device_state_init();
 
     ESP_ERROR_CHECK(reset_btn_start());
-    ESP_ERROR_CHECK(wifi_mgr_start_from_cfg(cfg_json_get()));  // ниже дам файл
+    ESP_ERROR_CHECK(wifi_mgr_start_from_cfg(cfg_json_get()));
     ESP_ERROR_CHECK(web_server_start());
 
-    ESP_ERROR_CHECK(matter_mgr_start(NULL)); // заглушка/потом подключим
+    ESP_ERROR_CHECK(matter_mgr_start(NULL));
+    ESP_ERROR_CHECK(app_loop_start());
 
     ESP_LOGI(TAG, "System started");
 }
