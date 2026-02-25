@@ -1,5 +1,6 @@
 # PlatformIO build artifacts
 .pio/
+build/
 
 # ESP-IDF Component Manager (managed components and lockfile)
 managed_components/
@@ -20,3 +21,6 @@ dependencies.lock
 # OS junk
 .DS_Store
 Thumbs.db
+
+# ESP-IDF local backup
+sdkconfig.old
