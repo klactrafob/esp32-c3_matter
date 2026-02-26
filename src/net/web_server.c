@@ -8,6 +8,8 @@
 #include "esp_http_server.h"
 #include "esp_system.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "core/cfg_json.h"
 #include "core/modules.h"
@@ -17,6 +19,27 @@
 
 static const char *TAG = "web";
 static httpd_handle_t s_server = NULL;
+
+typedef struct {
+    cJSON *cfg_dup;
+} apply_ctx_t;
+
+static void apply_cfg_task(void *arg)
+{
+    apply_ctx_t *task_ctx = (apply_ctx_t *)arg;
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    esp_err_t aerr = wifi_mgr_restart_from_cfg(task_ctx->cfg_dup);
+    if (aerr != ESP_OK) {
+        ESP_LOGE(TAG, "wifi reconfigure failed: %s", esp_err_to_name(aerr));
+    } else {
+        ESP_LOGI(TAG, "wifi reconfigure applied");
+    }
+
+    cJSON_Delete(task_ctx->cfg_dup);
+    free(task_ctx);
+    vTaskDelete(NULL);
+}
 
 static const char *INDEX_HTML =
 "<!doctype html><html><head><meta charset='utf-8'/>"
@@ -207,8 +230,12 @@ static const char *INDEX_HTML =
 " saveNetwork();"
 "}"
 "async function applyNow(){"
-" const r=await fetch('/api/apply',{method:'POST'});"
-" alert(tt('apply_status')+r.status);"
+" try{"
+"  const r=await fetch('/api/apply',{method:'POST'});"
+"  if(!r.ok){msg(tt('apply_status')+r.status,false); return;}"
+"  msg(tt('apply_status')+r.status,true);"
+"  setTimeout(boot,700);"
+" }catch(e){msg(String(e),false);}"
 "}"
 "boot();"
 "</script></body></html>";
@@ -449,15 +476,31 @@ static esp_err_t handle_post_config(httpd_req_t *req)
 
 static esp_err_t handle_apply(httpd_req_t *req)
 {
-    (void)req;
     esp_err_t err = modules_apply_config(cfg_json_get());
     if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply failed");
 
-    cJSON *ok = cJSON_CreateObject();
-    cJSON_AddBoolToObject(ok, "ok", true);
-    cJSON_AddStringToObject(ok, "note", "modules applied");
-    esp_err_t r = json_send(req, ok, 200);
-    cJSON_Delete(ok);
+    apply_ctx_t *ctx = (apply_ctx_t *)calloc(1, sizeof(apply_ctx_t));
+    if (!ctx) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+
+    ctx->cfg_dup = cJSON_Duplicate((cJSON *)cfg_json_get(), 1);
+    if (!ctx->cfg_dup) {
+        free(ctx);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    }
+
+    BaseType_t task_ok = xTaskCreate(apply_cfg_task, "apply_cfg", 4096, ctx, 4, NULL);
+
+    if (task_ok != pdPASS) {
+        cJSON_Delete(ctx->cfg_dup);
+        free(ctx);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply task failed");
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "note", "modules applied, wifi reconfigure scheduled");
+    esp_err_t r = json_send(req, resp, 200);
+    cJSON_Delete(resp);
     return r;
 }
 

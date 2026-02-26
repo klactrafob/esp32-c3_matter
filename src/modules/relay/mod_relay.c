@@ -2,6 +2,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "device_state.h"
 
 static const char *TAG = "mod_relay";
 
@@ -16,6 +17,7 @@ static void relay_write(bool on)
     int lvl = on ? s_active_level : (1 - s_active_level);
     gpio_set_level(s_gpio, lvl);
     s_state = on;
+    device_state_set_relay(on);
 }
 
 esp_err_t mod_relay_apply(const cJSON *cfg)
@@ -44,6 +46,7 @@ esp_err_t mod_relay_apply(const cJSON *cfg)
         s_enabled = false;
         s_gpio = -1;
         s_state = false;
+        device_state_set_relay(false);
         return ESP_OK;
     }
 
@@ -77,6 +80,21 @@ cJSON *mod_relay_status_json(void)
     return o;
 }
 
+esp_err_t mod_relay_set_state(bool on)
+{
+    if (!s_enabled) return ESP_ERR_INVALID_STATE;
+    relay_write(on);
+    return ESP_OK;
+}
+
+esp_err_t mod_relay_get_state(bool *on)
+{
+    if (!on) return ESP_ERR_INVALID_ARG;
+    *on = s_state;
+    if (!s_enabled) return ESP_ERR_INVALID_STATE;
+    return ESP_OK;
+}
+
 // action: { "set": true } или { "toggle": true }
 esp_err_t mod_relay_action(const cJSON *action, cJSON **out_response)
 {
@@ -86,9 +104,9 @@ esp_err_t mod_relay_action(const cJSON *action, cJSON **out_response)
     const cJSON *tgl = cJSON_GetObjectItemCaseSensitive((cJSON*)action, "toggle");
 
     if (cJSON_IsBool(set)) {
-        relay_write(cJSON_IsTrue(set));
+        mod_relay_set_state(cJSON_IsTrue(set));
     } else if (cJSON_IsBool(tgl) && cJSON_IsTrue(tgl)) {
-        relay_write(!s_state);
+        mod_relay_set_state(!s_state);
     } else {
         return ESP_ERR_INVALID_ARG;
     }

@@ -16,7 +16,7 @@ idf_component_register(
     "modules/pwm/mod_pwm.c"
     "modules/ws2812/mod_ws2812.c"
 
-    "matter_mgr.c"
+    "matter_mgr.cpp"
     "device_state.c"
 
   INCLUDE_DIRS

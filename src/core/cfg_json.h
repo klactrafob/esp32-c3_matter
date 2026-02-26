@@ -14,5 +14,8 @@ esp_err_t cfg_json_set_and_save(const cJSON *new_cfg);
 // Применить дефолт и сохранить
 esp_err_t cfg_json_reset_to_default(void);
 
+// Принудительный профиль "одно реле на GPIO12"
+esp_err_t cfg_json_force_relay_gpio12_profile(void);
+
 // Factory reset: стереть namespace конфига
 esp_err_t cfg_json_factory_reset(void);

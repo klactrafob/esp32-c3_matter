@@ -27,10 +27,10 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(cfg_json_load_or_default());
+    ESP_ERROR_CHECK(cfg_json_force_relay_gpio12_profile());
+    device_state_init();
     ESP_ERROR_CHECK(modules_init());
     ESP_ERROR_CHECK(modules_apply_config(cfg_json_get()));
-
-    device_state_init();
 
     ESP_ERROR_CHECK(reset_btn_start());
     ESP_ERROR_CHECK(wifi_mgr_start_from_cfg(cfg_json_get()));

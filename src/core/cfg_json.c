@@ -1,6 +1,7 @@
 #include "cfg_json.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 #include "esp_log.h"
 #include "nvs.h"
@@ -30,8 +31,8 @@ static cJSON *make_default_cfg(void)
     cJSON *mods = cJSON_AddObjectToObject(root, "modules");
 
     cJSON *relay = cJSON_AddObjectToObject(mods, "relay");
-    cJSON_AddBoolToObject(relay, "enable", false);
-    cJSON_AddNumberToObject(relay, "gpio", 4);
+    cJSON_AddBoolToObject(relay, "enable", true);
+    cJSON_AddNumberToObject(relay, "gpio", 12);
     cJSON_AddNumberToObject(relay, "active_level", 1);
     cJSON_AddBoolToObject(relay, "default_on", false);
 
@@ -175,6 +176,66 @@ esp_err_t cfg_json_reset_to_default(void)
     esp_err_t err = cfg_json_set_and_save(def);
     cJSON_Delete(def);
     return err;
+}
+
+static bool upsert_bool(cJSON *obj, const char *key, bool value)
+{
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsBool(it) && cJSON_IsTrue(it) == value) return false;
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, key);
+    cJSON_AddBoolToObject(obj, key, value);
+    return true;
+}
+
+static bool upsert_number(cJSON *obj, const char *key, int value)
+{
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsNumber(it) && it->valueint == value) return false;
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, key);
+    cJSON_AddNumberToObject(obj, key, value);
+    return true;
+}
+
+esp_err_t cfg_json_force_relay_gpio12_profile(void)
+{
+    if (!cJSON_IsObject(s_cfg)) return ESP_ERR_INVALID_STATE;
+
+    bool changed = false;
+    cJSON *mods = cJSON_GetObjectItemCaseSensitive(s_cfg, "modules");
+    if (!cJSON_IsObject(mods)) {
+        cJSON_DeleteItemFromObjectCaseSensitive(s_cfg, "modules");
+        mods = cJSON_AddObjectToObject(s_cfg, "modules");
+        if (!mods) return ESP_ERR_NO_MEM;
+        changed = true;
+    }
+
+    cJSON *relay = cJSON_GetObjectItemCaseSensitive(mods, "relay");
+    if (!cJSON_IsObject(relay)) {
+        cJSON_DeleteItemFromObjectCaseSensitive(mods, "relay");
+        relay = cJSON_AddObjectToObject(mods, "relay");
+        if (!relay) return ESP_ERR_NO_MEM;
+        changed = true;
+    }
+
+    changed |= upsert_bool(relay, "enable", true);
+    changed |= upsert_number(relay, "gpio", 12);
+    changed |= upsert_number(relay, "active_level", 1);
+    changed |= upsert_bool(relay, "default_on", false);
+
+    cJSON *pwm = cJSON_GetObjectItemCaseSensitive(mods, "pwm");
+    if (cJSON_IsObject(pwm)) {
+        changed |= upsert_bool(pwm, "enable", false);
+    }
+
+    cJSON *ws = cJSON_GetObjectItemCaseSensitive(mods, "ws2812");
+    if (cJSON_IsObject(ws)) {
+        changed |= upsert_bool(ws, "enable", false);
+    }
+
+    if (!changed) return ESP_OK;
+
+    ESP_LOGI(TAG, "Applying fixed device profile: relay on GPIO12");
+    return cfg_json_set_and_save(s_cfg);
 }
 
 esp_err_t cfg_json_factory_reset(void)
