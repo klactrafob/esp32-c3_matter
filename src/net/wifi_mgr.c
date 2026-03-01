@@ -19,7 +19,7 @@
 static const char *TAG = "wifi";
 
 #define STA_RETRY_PERIOD_MS       5000
-#define STA_TO_AP_FALLBACK_MS    20000
+#define STA_TO_AP_FALLBACK_MS     8000
 #define WIFI_MONITOR_PERIOD_MS    1000
 #define STA_SCAN_HOLD_WITH_AP_CLIENT_MS 30000
 
@@ -242,6 +242,171 @@ static bool sta_target_available(void)
     return found;
 }
 
+static int compare_ap_record_rssi_desc(const void *a, const void *b)
+{
+    const wifi_ap_record_t *ra = (const wifi_ap_record_t *)a;
+    const wifi_ap_record_t *rb = (const wifi_ap_record_t *)b;
+    return ((int)rb->rssi - (int)ra->rssi);
+}
+
+static const char *auth_mode_to_text(wifi_auth_mode_t mode)
+{
+    switch (mode) {
+        case WIFI_AUTH_OPEN: return "open";
+        case WIFI_AUTH_WEP: return "wep";
+        case WIFI_AUTH_WPA_PSK: return "wpa";
+        case WIFI_AUTH_WPA2_PSK: return "wpa2";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "wpa/wpa2";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "wpa2-ent";
+#if defined(WIFI_AUTH_WPA3_PSK)
+        case WIFI_AUTH_WPA3_PSK: return "wpa3";
+#endif
+#if defined(WIFI_AUTH_WPA2_WPA3_PSK)
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "wpa2/wpa3";
+#endif
+#if defined(WIFI_AUTH_WAPI_PSK)
+        case WIFI_AUTH_WAPI_PSK: return "wapi";
+#endif
+#if defined(WIFI_AUTH_OWE)
+        case WIFI_AUTH_OWE: return "owe";
+#endif
+#if defined(WIFI_AUTH_WPA3_ENT_192)
+        case WIFI_AUTH_WPA3_ENT_192: return "wpa3-ent";
+#endif
+#if defined(WIFI_AUTH_WPA3_EXT_PSK)
+        case WIFI_AUTH_WPA3_EXT_PSK: return "wpa3-ext";
+#endif
+#if defined(WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE)
+        case WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE: return "wpa3-ext-mixed";
+#endif
+        default: return "unknown";
+    }
+}
+
+static bool networks_array_has_ssid(const cJSON *arr, const char *ssid)
+{
+    if (!cJSON_IsArray((cJSON *)arr) || !ssid || !ssid[0]) return false;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, (cJSON *)arr) {
+        cJSON *s = cJSON_GetObjectItemCaseSensitive(item, "ssid");
+        if (cJSON_IsString(s) && s->valuestring && strcmp(s->valuestring, ssid) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+esp_err_t wifi_mgr_scan_networks(cJSON **out_networks)
+{
+    if (!out_networks) return ESP_ERR_INVALID_ARG;
+    *out_networks = NULL;
+
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return ESP_ERR_NO_MEM;
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) {
+        cJSON_Delete(arr);
+        return err;
+    }
+
+    bool switched_ap_to_apsta = false;
+    if (mode == WIFI_MODE_AP) {
+        err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (err != ESP_OK) {
+            cJSON_Delete(arr);
+            return err;
+        }
+        err = esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
+        if (err != ESP_OK) {
+            (void)esp_wifi_set_mode(WIFI_MODE_AP);
+            cJSON_Delete(arr);
+            return err;
+        }
+        switched_ap_to_apsta = true;
+    }
+
+    wifi_scan_config_t scan_cfg = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+    };
+
+    err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err == ESP_ERR_WIFI_STATE) {
+        (void)esp_wifi_scan_stop();
+        err = esp_wifi_scan_start(&scan_cfg, true);
+    }
+    if (err != ESP_OK) {
+        if (switched_ap_to_apsta) {
+            (void)esp_wifi_set_mode(WIFI_MODE_AP);
+            (void)esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
+        }
+        cJSON_Delete(arr);
+        return err;
+    }
+
+    uint16_t ap_count = 0;
+    err = esp_wifi_scan_get_ap_num(&ap_count);
+    if (err != ESP_OK) {
+        if (switched_ap_to_apsta) {
+            (void)esp_wifi_set_mode(WIFI_MODE_AP);
+            (void)esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
+        }
+        cJSON_Delete(arr);
+        return err;
+    }
+
+    if (ap_count > 0) {
+        uint16_t rec_count = ap_count;
+        wifi_ap_record_t *records = (wifi_ap_record_t *)calloc(rec_count, sizeof(wifi_ap_record_t));
+        if (!records) {
+            if (switched_ap_to_apsta) {
+                (void)esp_wifi_set_mode(WIFI_MODE_AP);
+                (void)esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
+            }
+            cJSON_Delete(arr);
+            return ESP_ERR_NO_MEM;
+        }
+
+        err = esp_wifi_scan_get_ap_records(&rec_count, records);
+        if (err == ESP_OK && rec_count > 0) {
+            qsort(records, rec_count, sizeof(wifi_ap_record_t), compare_ap_record_rssi_desc);
+            for (uint16_t i = 0; i < rec_count; ++i) {
+                const char *ssid = (const char *)records[i].ssid;
+                if (!ssid || !ssid[0]) continue;
+                if (networks_array_has_ssid(arr, ssid)) continue;
+
+                cJSON *it = cJSON_CreateObject();
+                if (!it) continue;
+                cJSON_AddStringToObject(it, "ssid", ssid);
+                cJSON_AddNumberToObject(it, "rssi", records[i].rssi);
+                cJSON_AddNumberToObject(it, "channel", records[i].primary);
+                cJSON_AddStringToObject(it, "auth", auth_mode_to_text(records[i].authmode));
+                cJSON_AddItemToArray(arr, it);
+            }
+        }
+
+        free(records);
+    }
+
+    if (switched_ap_to_apsta) {
+        esp_err_t restore_err = esp_wifi_set_mode(WIFI_MODE_AP);
+        if (restore_err == ESP_OK) {
+            restore_err = esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
+        }
+        if (restore_err != ESP_OK) {
+            cJSON_Delete(arr);
+            return restore_err;
+        }
+    }
+
+    *out_networks = arr;
+    return ESP_OK;
+}
+
 static void wifi_monitor_task(void *arg)
 {
     (void)arg;
@@ -307,7 +472,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         s_sta_last_try_us = esp_timer_get_time();
-        esp_wifi_connect();
+        if (s_sta_configured) {
+            esp_wifi_connect();
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_START) {
         ensure_ap_dhcp_server_started();
         ESP_LOGI(TAG, "AP interface started");

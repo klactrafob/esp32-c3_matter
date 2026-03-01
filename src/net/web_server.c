@@ -114,10 +114,14 @@ static const char *INDEX_HTML =
 "    <div class='col'><label id='lbl_ap_pass' for='ap_pass'></label><input id='ap_pass' maxlength='64'/></div>"
 "   </div>"
 "   <div class='row'>"
+"    <div class='col'><label id='lbl_sta_list' for='sta_list'></label><select id='sta_list' onchange='selectStaFromList()'></select></div>"
+"   </div>"
+"   <div class='row'>"
 "    <div class='col'><label id='lbl_sta_ssid' for='sta_ssid'></label><input id='sta_ssid' maxlength='32'/></div>"
 "    <div class='col'><label id='lbl_sta_pass' for='sta_pass'></label><input id='sta_pass' maxlength='64'/></div>"
 "   </div>"
 "   <div class='btns'>"
+"    <button id='btn_scan' onclick='scanNetworks()'></button>"
 "    <button id='btn_save' onclick='saveNetwork()'></button>"
 "    <button id='btn_clear_sta' onclick='clearSta()'></button>"
 "    <button id='btn_apply' onclick='applyNow()'></button>"
@@ -138,12 +142,14 @@ static const char *INDEX_HTML =
 "  net_t:'Network Settings',"
 "  net_h:'Set AP/STA credentials here. To use router connection, fill STA SSID and password.',"
 "  host:'Hostname',ap_ssid:'AP SSID (base)',ap_pass:'AP Password',"
+"  sta_list:'Detected Wi-Fi Networks',scan:'Scan Wi-Fi',scan_choose:'Select network...',"
 "  sta_ssid:'STA SSID (router)',sta_pass:'STA Password (router)',"
 "  save:'Save Network',clear_sta:'Clear STA',apply:'Apply',"
 "  foot:'Tip: open this page via captive portal or device IP.',"
 "  mode_sta:'Mode: Station',mode_ap:'Mode: Access Point',mode_un:'Mode: unavailable',"
 "  chip_ap:'AP SSID: ',chip_sta:'STA SSID: ',not_set:'not set',"
 "  save_ok:'Saved and applied.',save_fail:'Save failed: ',apply_status:'Apply status: ',"
+"  scan_wait:'Scanning Wi-Fi...',scan_fail:'Scan failed: ',scan_ok:'Networks found: ',"
 "  matter:'Matter in this firmware is currently a stub.'"
 " },"
 " ru:{"
@@ -176,11 +182,50 @@ static const char *INDEX_HTML =
 " setText('c_apply_t','ap_t'); setText('c_apply_d','ap_d');"
 " setText('net_title','net_t'); setText('net_hint','net_h');"
 " setText('lbl_host','host'); setText('lbl_ap_ssid','ap_ssid');"
-" setText('lbl_ap_pass','ap_pass'); setText('lbl_sta_ssid','sta_ssid'); setText('lbl_sta_pass','sta_pass');"
-" setText('btn_save','save'); setText('btn_clear_sta','clear_sta'); setText('btn_apply','apply');"
+" setText('lbl_ap_pass','ap_pass'); setText('lbl_sta_list','sta_list');"
+" setText('lbl_sta_ssid','sta_ssid'); setText('lbl_sta_pass','sta_pass');"
+" setText('btn_scan','scan'); setText('btn_save','save'); setText('btn_clear_sta','clear_sta'); setText('btn_apply','apply');"
 " setText('footer','foot');"
+" updateStaListPlaceholder();"
 "}"
 "function msg(t,ok){const e=document.getElementById('net_msg'); e.textContent=t; e.className=ok?'ok':'warn';}"
+"function updateStaListPlaceholder(){"
+" const s=document.getElementById('sta_list'); if(!s)return;"
+" if(s.options.length===0||s.options[0].value!==''){const o=document.createElement('option');o.value='';s.insertBefore(o,s.firstChild||null);}"
+" s.options[0].textContent=tt('scan_choose');"
+"}"
+"function selectStaFromList(){"
+" const s=document.getElementById('sta_list'); if(!s)return;"
+" const v=(s.value||'').trim();"
+" if(v){document.getElementById('sta_ssid').value=v;}"
+"}"
+"function populateStaList(list){"
+" const s=document.getElementById('sta_list'); if(!s)return;"
+" const selected=(document.getElementById('sta_ssid').value||'').trim();"
+" s.innerHTML='';"
+" const empty=document.createElement('option'); empty.value=''; empty.textContent=tt('scan_choose'); s.appendChild(empty);"
+" for(const n of (Array.isArray(list)?list:[])){"
+"  if(!n||!n.ssid) continue;"
+"  const o=document.createElement('option');"
+"  o.value=String(n.ssid);"
+"  const rssi=(n.rssi===undefined)?'':(' '+n.rssi+' dBm');"
+"  const auth=n.auth?(' '+n.auth):'';"
+"  o.textContent=String(n.ssid)+rssi+auth;"
+"  s.appendChild(o);"
+" }"
+" if(selected){s.value=selected;}"
+"}"
+"async function scanNetworks(silent){"
+" try{"
+"  if(!silent) msg(tt('scan_wait'),true);"
+"  const r=await fetch('/api/wifi/scan');"
+"  if(!r.ok){if(!silent) msg(tt('scan_fail')+r.status,false); return;}"
+"  const j=await r.json();"
+"  const list=Array.isArray(j.networks)?j.networks:[];"
+"  populateStaList(list);"
+"  if(!silent) msg(tt('scan_ok')+list.length,true);"
+" }catch(e){if(!silent) msg(String(e),false);}"
+"}"
 "let _cfg=null; let _rt=null;"
 "async function boot(){"
 " try{"
@@ -200,6 +245,7 @@ static const char *INDEX_HTML =
 "  document.getElementById('chip_ap').textContent=tt('chip_ap')+apSsid;"
 "  document.getElementById('chip_sta').textContent=tt('chip_sta')+staSsid;"
 "  document.getElementById('chip_mode').textContent=(_rt.mode==='sta')?tt('mode_sta'):tt('mode_ap');"
+"  scanNetworks(true);"
 " }catch(e){"
 "  document.getElementById('chip_mode').textContent=tt('mode_un');"
 " }"
@@ -531,6 +577,28 @@ static esp_err_t handle_get_runtime(httpd_req_t *req)
     return r;
 }
 
+static esp_err_t handle_wifi_scan(httpd_req_t *req)
+{
+    cJSON *networks = NULL;
+    esp_err_t err = wifi_mgr_scan_networks(&networks);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi scan failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan failed");
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        cJSON_Delete(networks);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    }
+
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddItemToObject(resp, "networks", networks);
+    esp_err_t r = json_send(req, resp, 200);
+    cJSON_Delete(resp);
+    return r;
+}
+
 // POST /api/modules/<name>/action  with JSON body
 static esp_err_t handle_module_action(httpd_req_t *req)
 {
@@ -599,6 +667,9 @@ esp_err_t web_server_start(void)
 
     httpd_uri_t runtime = {.uri="/api/runtime", .method=HTTP_GET, .handler=handle_get_runtime};
     httpd_register_uri_handler(s_server, &runtime);
+
+    httpd_uri_t wifi_scan = {.uri="/api/wifi/scan", .method=HTTP_GET, .handler=handle_wifi_scan};
+    httpd_register_uri_handler(s_server, &wifi_scan);
 
     httpd_uri_t act = {.uri="/api/modules/*/action", .method=HTTP_POST, .handler=handle_module_action};
     httpd_register_uri_handler(s_server, &act);

@@ -34,3 +34,12 @@ idf_component_register(
     lwip
     json
 )
+
+# Keep esp_matter build stable across toolchain updates without patching managed_components.
+if(TARGET __idf_espressif__esp_matter)
+  target_include_directories(
+    __idf_espressif__esp_matter
+    BEFORE PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/third_party_overrides"
+  )
+endif()
