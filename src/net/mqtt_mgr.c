@@ -74,6 +74,19 @@ static const char *jstr(const cJSON *o, const char *key, const char *def)
     return def;
 }
 
+static const char *jstr_alias(const cJSON *o, const char *key, const char *alias, const char *def)
+{
+    const cJSON *it = jobj(o, key);
+    if (cJSON_IsString(it) && it->valuestring && it->valuestring[0] != 0) {
+        return it->valuestring;
+    }
+    it = jobj(o, alias);
+    if (cJSON_IsString(it) && it->valuestring && it->valuestring[0] != 0) {
+        return it->valuestring;
+    }
+    return def;
+}
+
 static bool jbool(const cJSON *o, const char *key, bool def)
 {
     const cJSON *it = jobj(o, key);
@@ -83,9 +96,13 @@ static bool jbool(const cJSON *o, const char *key, bool def)
     return def;
 }
 
-static int jint(const cJSON *o, const char *key, int def)
+static int jint_alias(const cJSON *o, const char *key, const char *alias, int def)
 {
     const cJSON *it = jobj(o, key);
+    if (cJSON_IsNumber(it)) {
+        return it->valueint;
+    }
+    it = jobj(o, alias);
     if (cJSON_IsNumber(it)) {
         return it->valueint;
     }
@@ -104,7 +121,8 @@ static void build_node_id(void)
 {
     uint8_t mac[6] = {0};
     if (esp_efuse_mac_get_default(mac) == ESP_OK) {
-        snprintf(s_node_id, sizeof(s_node_id), "esp32c3-%02X%02X%02X", mac[3], mac[4], mac[5]);
+        snprintf(s_node_id, sizeof(s_node_id), "esp32c3-%02X%02X%02X%02X%02X%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     } else {
         snprintf(s_node_id, sizeof(s_node_id), "esp32c3-unknown");
     }
@@ -155,14 +173,14 @@ static esp_err_t parse_cfg(const cJSON *cfg, mqtt_cfg_t *out)
     out->enabled = jbool(mq, "enable", true);
     out->discovery = jbool(mq, "discovery", true);
     out->retain = jbool(mq, "retain", true);
-    out->port = jint(mq, "port", 1883);
+    out->port = jint_alias(mq, "port", "server_port", 1883);
     if (out->port <= 0 || out->port > 65535) {
         out->port = 1883;
     }
 
-    copy_str(out->host, sizeof(out->host), jstr(mq, "host", ""));
-    copy_str(out->username, sizeof(out->username), jstr(mq, "user", ""));
-    copy_str(out->password, sizeof(out->password), jstr(mq, "pass", ""));
+    copy_str(out->host, sizeof(out->host), jstr_alias(mq, "host", "server_ip", ""));
+    copy_str(out->username, sizeof(out->username), jstr_alias(mq, "user", "login", ""));
+    copy_str(out->password, sizeof(out->password), jstr_alias(mq, "pass", "password", ""));
     copy_str(out->client_id, sizeof(out->client_id), jstr(mq, "client_id", ""));
     copy_str(out->topic_prefix, sizeof(out->topic_prefix), jstr(mq, "topic_prefix", ""));
     copy_str(out->discovery_prefix, sizeof(out->discovery_prefix), jstr(mq, "discovery_prefix", "homeassistant"));

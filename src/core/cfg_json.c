@@ -1,22 +1,44 @@
 #include "cfg_json.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "nvs.h"
 
 static const char *TAG = "cfg_json";
 static const char *NVS_NS = "cfg";
 static const char *NVS_KEY = "json";
+static const char *MQTT_DISCOVERY_PREFIX_DEFAULT = "homeassistant";
+static const char *MQTT_DEVICE_NAME_DEFAULT = "ESP32 C3 Relay";
+static const char *MQTT_LEGACY_TOPIC_PREFIX = "esp32-c3/relay1";
 
 static cJSON *s_cfg = NULL;
+
+static void build_board_node_id(char *dst, size_t dst_len)
+{
+    if (!dst || dst_len == 0) {
+        return;
+    }
+
+    uint8_t mac[6] = {0};
+    if (esp_efuse_mac_get_default(mac) == ESP_OK) {
+        snprintf(dst, dst_len, "esp32c3-%02X%02X%02X%02X%02X%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        snprintf(dst, dst_len, "esp32c3-unknown");
+    }
+}
 
 static cJSON *make_default_cfg(void)
 {
     // Base default: AP/STA + MQTT + single relay module.
     cJSON *root = cJSON_CreateObject();
+    char node_id[40] = {0};
+    build_board_node_id(node_id, sizeof(node_id));
 
     cJSON *net = cJSON_AddObjectToObject(root, "net");
     cJSON_AddStringToObject(net, "hostname", "esp32-c3");
@@ -32,13 +54,17 @@ static cJSON *make_default_cfg(void)
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddBoolToObject(mqtt, "enable", true);
     cJSON_AddStringToObject(mqtt, "host", "");
+    cJSON_AddStringToObject(mqtt, "server_ip", "");
     cJSON_AddNumberToObject(mqtt, "port", 1883);
+    cJSON_AddNumberToObject(mqtt, "server_port", 1883);
     cJSON_AddStringToObject(mqtt, "user", "");
+    cJSON_AddStringToObject(mqtt, "login", "");
     cJSON_AddStringToObject(mqtt, "pass", "");
-    cJSON_AddStringToObject(mqtt, "client_id", "");
-    cJSON_AddStringToObject(mqtt, "topic_prefix", "esp32-c3/relay1");
-    cJSON_AddStringToObject(mqtt, "discovery_prefix", "homeassistant");
-    cJSON_AddStringToObject(mqtt, "device_name", "ESP32 C3 Relay");
+    cJSON_AddStringToObject(mqtt, "password", "");
+    cJSON_AddStringToObject(mqtt, "client_id", node_id);
+    cJSON_AddStringToObject(mqtt, "topic_prefix", node_id);
+    cJSON_AddStringToObject(mqtt, "discovery_prefix", MQTT_DISCOVERY_PREFIX_DEFAULT);
+    cJSON_AddStringToObject(mqtt, "device_name", MQTT_DEVICE_NAME_DEFAULT);
     cJSON_AddBoolToObject(mqtt, "discovery", true);
     cJSON_AddBoolToObject(mqtt, "retain", true);
 
@@ -248,6 +274,99 @@ static bool ensure_string(cJSON *obj, const char *key, const char *value)
     return true;
 }
 
+static bool upsert_string(cJSON *obj, const char *key, const char *value)
+{
+    const char *val = value ? value : "";
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsString(it) && it->valuestring && strcmp(it->valuestring, val) == 0) {
+        return false;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, key);
+    cJSON_AddStringToObject(obj, key, val);
+    return true;
+}
+
+static const char *jstr_nonnull(cJSON *obj, const char *key)
+{
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsString(it) && it->valuestring) {
+        return it->valuestring;
+    }
+    return "";
+}
+
+static int jint_or_default(cJSON *obj, const char *key, int def)
+{
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsNumber(it)) {
+        return it->valueint;
+    }
+    return def;
+}
+
+static bool normalize_mqtt_server_aliases(cJSON *mqtt)
+{
+    bool changed = false;
+
+    const char *host = jstr_nonnull(mqtt, "host");
+    const char *server_ip = jstr_nonnull(mqtt, "server_ip");
+    if (host[0] != 0) {
+        changed |= upsert_string(mqtt, "server_ip", host);
+    } else if (server_ip[0] != 0) {
+        changed |= upsert_string(mqtt, "host", server_ip);
+    }
+
+    const char *user = jstr_nonnull(mqtt, "user");
+    const char *login = jstr_nonnull(mqtt, "login");
+    if (user[0] != 0) {
+        changed |= upsert_string(mqtt, "login", user);
+    } else if (login[0] != 0) {
+        changed |= upsert_string(mqtt, "user", login);
+    }
+
+    const char *pass = jstr_nonnull(mqtt, "pass");
+    const char *password = jstr_nonnull(mqtt, "password");
+    if (pass[0] != 0) {
+        changed |= upsert_string(mqtt, "password", pass);
+    } else if (password[0] != 0) {
+        changed |= upsert_string(mqtt, "pass", password);
+    }
+
+    int port = jint_or_default(mqtt, "port", 0);
+    int server_port = jint_or_default(mqtt, "server_port", 0);
+    if (port > 0 && port <= 65535) {
+        changed |= upsert_number(mqtt, "server_port", port);
+    } else if (server_port > 0 && server_port <= 65535) {
+        changed |= upsert_number(mqtt, "port", server_port);
+        changed |= upsert_number(mqtt, "server_port", server_port);
+    } else {
+        changed |= upsert_number(mqtt, "port", 1883);
+        changed |= upsert_number(mqtt, "server_port", 1883);
+    }
+
+    return changed;
+}
+
+static bool normalize_mqtt_identity(cJSON *mqtt)
+{
+    char node_id[40] = {0};
+    build_board_node_id(node_id, sizeof(node_id));
+
+    bool changed = false;
+    cJSON *topic_prefix = cJSON_GetObjectItemCaseSensitive(mqtt, "topic_prefix");
+    if (!cJSON_IsString(topic_prefix) || !topic_prefix->valuestring || topic_prefix->valuestring[0] == 0 ||
+        strcmp(topic_prefix->valuestring, MQTT_LEGACY_TOPIC_PREFIX) == 0) {
+        changed |= upsert_string(mqtt, "topic_prefix", node_id);
+    }
+
+    cJSON *client_id = cJSON_GetObjectItemCaseSensitive(mqtt, "client_id");
+    if (!cJSON_IsString(client_id) || !client_id->valuestring || client_id->valuestring[0] == 0) {
+        changed |= upsert_string(mqtt, "client_id", node_id);
+    }
+
+    return changed;
+}
+
 static bool delete_if_present(cJSON *obj, const char *key)
 {
     cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
@@ -307,15 +426,21 @@ esp_err_t cfg_json_force_relay_gpio12_profile(void)
 
     changed |= ensure_bool(mqtt, "enable", true);
     changed |= ensure_string(mqtt, "host", "");
+    changed |= ensure_string(mqtt, "server_ip", "");
     changed |= ensure_number(mqtt, "port", 1883);
+    changed |= ensure_number(mqtt, "server_port", 1883);
     changed |= ensure_string(mqtt, "user", "");
+    changed |= ensure_string(mqtt, "login", "");
     changed |= ensure_string(mqtt, "pass", "");
+    changed |= ensure_string(mqtt, "password", "");
     changed |= ensure_string(mqtt, "client_id", "");
-    changed |= ensure_string(mqtt, "topic_prefix", "esp32-c3/relay1");
-    changed |= ensure_string(mqtt, "discovery_prefix", "homeassistant");
-    changed |= ensure_string(mqtt, "device_name", "ESP32 C3 Relay");
+    changed |= ensure_string(mqtt, "topic_prefix", "");
+    changed |= ensure_string(mqtt, "discovery_prefix", MQTT_DISCOVERY_PREFIX_DEFAULT);
+    changed |= ensure_string(mqtt, "device_name", MQTT_DEVICE_NAME_DEFAULT);
     changed |= ensure_bool(mqtt, "discovery", true);
     changed |= ensure_bool(mqtt, "retain", true);
+    changed |= normalize_mqtt_server_aliases(mqtt);
+    changed |= normalize_mqtt_identity(mqtt);
 
     if (!changed) {
         return ESP_OK;
