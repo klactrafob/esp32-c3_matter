@@ -9,14 +9,12 @@ idf_component_register(
     "net/wifi_mgr.c"
     "net/dns_server.c"
     "net/web_server.c"
+    "net/mqtt_mgr.c"
 
     "drivers/reset_btn.c"
 
     "modules/relay/mod_relay.c"
-    "modules/pwm/mod_pwm.c"
-    "modules/ws2812/mod_ws2812.c"
 
-    "matter_mgr.cpp"
     "device_state.c"
 
   INCLUDE_DIRS
@@ -33,13 +31,5 @@ idf_component_register(
     driver
     lwip
     json
+    mqtt
 )
-
-# Keep esp_matter build stable across toolchain updates without patching managed_components.
-if(TARGET __idf_espressif__esp_matter)
-  target_include_directories(
-    __idf_espressif__esp_matter
-    BEFORE PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/third_party_overrides"
-  )
-endif()

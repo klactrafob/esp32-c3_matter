@@ -37,6 +37,7 @@ static bool s_wifi_handlers_registered = false;
 static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
 static volatile bool s_ap_restore_pending = false;
+static volatile bool s_ap_restore_enabled = true;
 
 static char s_ap_ssid[33] = {0};
 static wifi_config_t s_ap_cfg = {0};
@@ -44,6 +45,16 @@ static wifi_config_t s_sta_cfg = {0};
 
 bool wifi_mgr_is_ap(void) { return s_is_ap; }
 const char *wifi_mgr_get_ap_ssid(void) { return s_ap_ssid; }
+bool wifi_mgr_sta_configured(void) { return s_sta_configured; }
+bool wifi_mgr_sta_has_ip(void) { return s_sta_has_ip; }
+void wifi_mgr_set_ap_restore_enabled(bool enabled)
+{
+    s_ap_restore_enabled = enabled;
+    if (!enabled) {
+        s_ap_restore_pending = false;
+    }
+    ESP_LOGI(TAG, "AP auto-restore: %s", enabled ? "enabled" : "disabled");
+}
 
 static const cJSON *jobj(const cJSON *o, const char *k)
 {
@@ -164,6 +175,7 @@ static void ensure_ap_dhcp_server_started(void)
 
 static void ensure_ap_remains_enabled(void)
 {
+    if (!s_ap_restore_enabled) return;
     if (!s_ap_always_on) return;
 
     wifi_mode_t mode = WIFI_MODE_NULL;
@@ -186,6 +198,12 @@ static void ensure_ap_remains_enabled(void)
     err = esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "restore AP config failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        ESP_LOGW(TAG, "restore AP start failed: %s", esp_err_to_name(err));
         return;
     }
 
@@ -415,14 +433,14 @@ static void wifi_monitor_task(void *arg)
     const int64_t fallback_us = (int64_t)STA_TO_AP_FALLBACK_MS * 1000;
 
     while (1) {
+        int64_t now_us = esp_timer_get_time();
+        if (s_ap_restore_enabled && (s_ap_restore_pending || s_ap_always_on)) {
+            ensure_ap_remains_enabled();
+        }
+
         if (!s_sta_configured) {
             vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_PERIOD_MS));
             continue;
-        }
-
-        int64_t now_us = esp_timer_get_time();
-        if (s_ap_restore_pending || s_ap_always_on) {
-            ensure_ap_remains_enabled();
         }
 
         if (s_sta_has_ip) {
@@ -480,7 +498,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ESP_LOGI(TAG, "AP interface started");
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STOP) {
         ESP_LOGW(TAG, "AP interface stopped");
-        if (s_ap_always_on) {
+        if (s_ap_restore_enabled && s_ap_always_on) {
             s_ap_restore_pending = true;
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
@@ -572,6 +590,7 @@ static esp_err_t start_ap_only(const char *ssid, const char *pass)
 
     fill_ap_cfg(ssid, pass);
     ESP_LOGI(TAG, "Starting AP-only: %s", s_ap_ssid);
+    ESP_LOGI(TAG, "AP security: %s", (s_ap_cfg.ap.authmode == WIFI_AUTH_OPEN) ? "OPEN" : "WPA2-PSK");
     ESP_LOGW(TAG, "STA is not configured (net.sta.ssid empty), staying in AP-only mode");
 
     err = ensure_netif_event_loop();
@@ -589,6 +608,11 @@ static esp_err_t start_ap_only(const char *ssid, const char *pass)
 
     ESP_LOGI(TAG, "AP started: ssid=%s channel=%u auth=%d", s_ap_ssid,
              s_ap_cfg.ap.channel, s_ap_cfg.ap.authmode);
+
+    if (s_wifi_mon_task == NULL) {
+        BaseType_t ok = xTaskCreate(wifi_monitor_task, "wifi_mon", 3072, NULL, 5, &s_wifi_mon_task);
+        if (ok != pdPASS) return ESP_FAIL;
+    }
 
     return ESP_OK;
 }
@@ -670,6 +694,7 @@ esp_err_t wifi_mgr_restart_from_cfg(const cJSON *cfg)
 #endif
 
     s_ap_restore_pending = false;
+    s_ap_restore_enabled = true;
     s_ap_client_count = 0;
     s_ap_last_client_evt_us = esp_timer_get_time();
 

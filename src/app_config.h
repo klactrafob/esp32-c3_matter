@@ -1,11 +1,7 @@
 #pragma once
 
-#ifndef APP_ENABLE_MATTER
-#define APP_ENABLE_MATTER 0
-#endif
-
 #define APP_AP_SSID_DEFAULT   "ESP32-SETUP"
-#define APP_AP_PASS_DEFAULT   "12345678"
+#define APP_AP_PASS_DEFAULT   ""
 #define APP_HOSTNAME_DEFAULT  "esp32-c3"
 
 // ===== Factory reset button =====

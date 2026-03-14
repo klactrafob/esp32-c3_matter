@@ -27,17 +27,23 @@ static void do_factory_reset(void)
 {
     ESP_LOGE(TAG, "FACTORY RESET: cfg_json + wifi");
 
-    // стереть JSON конфиг
+    // Reset persisted app config JSON.
     esp_err_t err = cfg_json_factory_reset();
-    if (err != ESP_OK) ESP_LOGW(TAG, "cfg_json_factory_reset: %s", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "cfg_json_factory_reset: %s", esp_err_to_name(err));
+    }
 
-    // сброс Wi-Fi NVS
+    // Reset Wi-Fi configuration stored by ESP-IDF.
     err = esp_wifi_restore();
-    if (err != ESP_OK) ESP_LOGW(TAG, "esp_wifi_restore: %s", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_restore: %s", esp_err_to_name(err));
+    }
 
-    // чтобы не попасть в reset-loop
+    // Avoid reset loop while button is still held.
     ESP_LOGW(TAG, "Waiting for button release...");
-    while (is_pressed()) vTaskDelay(pdMS_TO_TICKS(50));
+    while (is_pressed()) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
@@ -78,7 +84,7 @@ esp_err_t reset_btn_start(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = (APP_RESET_BTN_ACTIVE_LEVEL == 0) ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
         .pull_down_en = (APP_RESET_BTN_ACTIVE_LEVEL == 1) ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
+        .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&io));
 
