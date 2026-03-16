@@ -1,4 +1,5 @@
 #include "net/dns_server.h"
+#include "app_watchdog.h"
 #include "esp_log.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -26,6 +27,7 @@ typedef struct {
 static void dns_task(void *arg)
 {
     (void)arg;
+    app_watchdog_register_current_task(TAG);
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(53);
@@ -34,17 +36,24 @@ static void dns_task(void *arg)
     s_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (s_sock < 0) {
         ESP_LOGE(TAG, "socket() failed");
+        app_watchdog_unregister_current_task(TAG);
         vTaskDelete(NULL);
         return;
     }
 
     int yes = 1;
     setsockopt(s_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct timeval rx_timeout = {
+        .tv_sec = 1,
+        .tv_usec = 0,
+    };
+    setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &rx_timeout, sizeof(rx_timeout));
 
     if (bind(s_sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         ESP_LOGE(TAG, "bind() failed (need port 53 free)");
         close(s_sock);
         s_sock = -1;
+        app_watchdog_unregister_current_task(TAG);
         vTaskDelete(NULL);
         return;
     }
@@ -58,9 +67,10 @@ static void dns_task(void *arg)
         struct sockaddr_in from = {0};
         socklen_t flen = sizeof(from);
         int r = recvfrom(s_sock, rx, sizeof(rx), 0, (struct sockaddr*)&from, &flen);
-        if (r <= (int)sizeof(dns_hdr_t)) continue;
-
-        dns_hdr_t *h = (dns_hdr_t*)rx;
+        if (r <= (int)sizeof(dns_hdr_t)) {
+            app_watchdog_reset_current_task(TAG);
+            continue;
+        }
 
         // Only handle standard queries
         // Build response: copy query, set flags, set ancount=1
@@ -94,6 +104,7 @@ static void dns_task(void *arg)
         tx[idx++] = 192; tx[idx++] = 168; tx[idx++] = 4; tx[idx++] = 1;
 
         sendto(s_sock, tx, idx, 0, (struct sockaddr*)&from, flen);
+        app_watchdog_reset_current_task(TAG);
     }
 
     ESP_LOGI(TAG, "DNS captive stopped");
@@ -101,6 +112,7 @@ static void dns_task(void *arg)
         close(s_sock);
         s_sock = -1;
     }
+    app_watchdog_unregister_current_task(TAG);
     s_task = NULL;
     vTaskDelete(NULL);
 }

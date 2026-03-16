@@ -1,5 +1,6 @@
 #include "drivers/reset_btn.h"
 #include "app_config.h"
+#include "app_watchdog.h"
 
 #include "core/cfg_json.h"
 
@@ -42,6 +43,7 @@ static void do_factory_reset(void)
     // Avoid reset loop while button is still held.
     ESP_LOGW(TAG, "Waiting for button release...");
     while (is_pressed()) {
+        app_watchdog_reset_current_task(TAG);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
@@ -53,6 +55,7 @@ static void reset_btn_task(void *arg)
 {
     (void)arg;
     int64_t pressed_since_us = -1;
+    app_watchdog_register_current_task(TAG);
 
     while (1) {
         if (is_pressed()) {
@@ -73,6 +76,7 @@ static void reset_btn_task(void *arg)
             pressed_since_us = -1;
         }
 
+        app_watchdog_reset_current_task(TAG);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }

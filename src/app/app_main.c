@@ -10,6 +10,7 @@
 #include "core/modules.h"
 
 #include "device_state.h"
+#include "app_watchdog.h"
 #include "app_loop.h"
 #include "app_config.h"
 
@@ -29,6 +30,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(cfg_json_load_or_default());
     ESP_ERROR_CHECK(cfg_json_force_relay_gpio12_profile());
+    ESP_ERROR_CHECK(app_watchdog_ensure_init());
     device_state_init();
     ESP_ERROR_CHECK(modules_init());
     ESP_ERROR_CHECK(modules_apply_config(cfg_json_get()));

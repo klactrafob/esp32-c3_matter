@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "app_watchdog.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -428,6 +429,7 @@ esp_err_t wifi_mgr_scan_networks(cJSON **out_networks)
 static void wifi_monitor_task(void *arg)
 {
     (void)arg;
+    app_watchdog_register_current_task("wifi_mon");
 
     const int64_t retry_us = (int64_t)STA_RETRY_PERIOD_MS * 1000;
     const int64_t fallback_us = (int64_t)STA_TO_AP_FALLBACK_MS * 1000;
@@ -439,6 +441,7 @@ static void wifi_monitor_task(void *arg)
         }
 
         if (!s_sta_configured) {
+            app_watchdog_reset_current_task("wifi_mon");
             vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_PERIOD_MS));
             continue;
         }
@@ -453,6 +456,7 @@ static void wifi_monitor_task(void *arg)
                                             ((int64_t)STA_SCAN_HOLD_WITH_AP_CLIENT_MS * 1000));
 
             if (hold_scan_for_ap_client) {
+                app_watchdog_reset_current_task("wifi_mon");
                 vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_PERIOD_MS));
                 continue;
             }
@@ -460,7 +464,9 @@ static void wifi_monitor_task(void *arg)
             if ((now_us - s_sta_last_try_us) >= retry_us) {
                 bool can_connect = true;
                 if (s_ap_fallback_on) {
+                    app_watchdog_reset_current_task("wifi_mon");
                     can_connect = sta_target_available();
+                    app_watchdog_reset_current_task("wifi_mon");
                     if (!can_connect) {
                         ESP_LOGI(TAG, "STA SSID not visible yet, keep AP fallback");
                     }
@@ -480,6 +486,7 @@ static void wifi_monitor_task(void *arg)
             }
         }
 
+        app_watchdog_reset_current_task("wifi_mon");
         vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_PERIOD_MS));
     }
 }

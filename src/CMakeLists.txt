@@ -1,5 +1,6 @@
 idf_component_register(
   SRCS
+    "app_watchdog.c"
     "app/app_main.c"
     "app_loop.c"
 
@@ -21,6 +22,7 @@ idf_component_register(
     "."
 
   REQUIRES
+    esp_system
     nvs_flash
     esp_wifi
     esp_event

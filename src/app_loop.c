@@ -1,8 +1,8 @@
 #include "app_loop.h"
 #include <inttypes.h>
 
+#include "app_watchdog.h"
 #include "esp_log.h"
-#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -12,29 +12,10 @@ static const char *TAG = "app_loop";
 #define LOOP_PERIOD_MS       20
 #define STATS_PRINT_EVERY_MS 2000
 
-#define APP_WDT_TIMEOUT_S    5
-#define APP_WDT_PANIC        0
-
 static void loop_task(void *arg)
 {
     (void)arg;
-
-    // Prefer attaching to an existing TWDT instance. Initialize only if needed.
-    esp_err_t err = esp_task_wdt_add(NULL);
-    if (err == ESP_ERR_INVALID_STATE) {
-        esp_task_wdt_config_t wdt_cfg = {
-            .timeout_ms = APP_WDT_TIMEOUT_S * 1000,
-            .idle_core_mask = 0,
-            .trigger_panic = APP_WDT_PANIC,
-        };
-        err = esp_task_wdt_init(&wdt_cfg);
-        if (err == ESP_OK) {
-            err = esp_task_wdt_add(NULL);
-        }
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "TWDT setup failed: %s", esp_err_to_name(err));
-    }
+    app_watchdog_register_current_task(TAG);
 
     TickType_t last_wake = xTaskGetTickCount();
 
@@ -57,9 +38,7 @@ static void loop_task(void *arg)
             max_work_us = work_us;
         }
 
-        if (esp_task_wdt_reset() != ESP_OK) {
-            ESP_LOGW(TAG, "TWDT reset failed");
-        }
+        app_watchdog_reset_current_task(TAG);
 
         int64_t elapsed_ms = (t1 - stats_t0_us) / 1000;
         if (elapsed_ms >= STATS_PRINT_EVERY_MS && n > 0) {
