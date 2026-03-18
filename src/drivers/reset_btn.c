@@ -3,6 +3,7 @@
 #include "app_watchdog.h"
 
 #include "core/cfg_json.h"
+#include "core/modules.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -24,17 +25,15 @@ static bool is_pressed(void)
     return read_btn_level() == APP_RESET_BTN_ACTIVE_LEVEL;
 }
 
-static void do_factory_reset(void)
+static void do_connectivity_reset(void)
 {
-    ESP_LOGE(TAG, "FACTORY RESET: cfg_json + wifi");
+    ESP_LOGW(TAG, "CONNECTIVITY RESET: Wi-Fi + MQTT");
 
-    // Reset persisted app config JSON.
-    esp_err_t err = cfg_json_factory_reset();
+    esp_err_t err = cfg_json_clear_connectivity();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "cfg_json_factory_reset: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "cfg_json_clear_connectivity: %s", esp_err_to_name(err));
     }
 
-    // Reset Wi-Fi configuration stored by ESP-IDF.
     err = esp_wifi_restore();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_restore: %s", esp_err_to_name(err));
@@ -49,6 +48,24 @@ static void do_factory_reset(void)
 
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
+}
+
+static void handle_short_press(void)
+{
+    bool any_on = modules_is_any_output_on();
+    bool target_on = !any_on;
+
+    esp_err_t err = modules_set_master_output(target_on);
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Short press ignored: no active output modules");
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Short press output toggle failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Short press -> outputs %s", target_on ? "ON" : "OFF");
 }
 
 static void reset_btn_task(void *arg)
@@ -68,11 +85,17 @@ static void reset_btn_task(void *arg)
             } else {
                 int64_t held_ms = (esp_timer_get_time() - pressed_since_us) / 1000;
                 if (held_ms >= APP_RESET_HOLD_MS) {
-                    ESP_LOGE(TAG, "Factory reset! (held %lld ms)", (long long)held_ms);
-                    do_factory_reset();
+                    ESP_LOGW(TAG, "Connectivity reset! (held %lld ms)", (long long)held_ms);
+                    do_connectivity_reset();
                 }
             }
         } else {
+            if (pressed_since_us >= 0) {
+                int64_t held_ms = (esp_timer_get_time() - pressed_since_us) / 1000;
+                if (held_ms >= APP_RESET_DEBOUNCE_MS && held_ms < APP_RESET_HOLD_MS) {
+                    handle_short_press();
+                }
+            }
             pressed_since_us = -1;
         }
 

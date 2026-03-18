@@ -1,14 +1,27 @@
 #pragma once
-#include "esp_err.h"
+
+#include <stdbool.h>
+
 #include "cJSON.h"
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef void (*modules_runtime_callback_t)(void *ctx);
 
 esp_err_t modules_init(void);
-
-// Применить конфиг: включить/выключить и настроить модули
 esp_err_t modules_apply_config(const cJSON *cfg);
 
-// JSON статусы модулей (caller free)
 cJSON *modules_build_status_json(void);
+esp_err_t modules_action(const char *id, const cJSON *action, cJSON **out_response);
 
-// Действия: POST /api/modules/<name>/action
-esp_err_t modules_action(const char *name, const cJSON *action, cJSON **out_response);
+esp_err_t modules_set_master_output(bool on);
+bool modules_is_any_output_on(void);
+
+void modules_set_runtime_callback(modules_runtime_callback_t cb, void *ctx);
+
+#ifdef __cplusplus
+}
+#endif

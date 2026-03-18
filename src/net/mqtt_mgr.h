@@ -11,7 +11,7 @@ extern "C" {
 
 esp_err_t mqtt_mgr_start_from_cfg(const cJSON *cfg);
 esp_err_t mqtt_mgr_restart_from_cfg(const cJSON *cfg);
-esp_err_t mqtt_mgr_notify_relay_state(bool on);
+esp_err_t mqtt_mgr_notify_runtime_changed(void);
 bool mqtt_mgr_is_connected(void);
 
 #ifdef __cplusplus

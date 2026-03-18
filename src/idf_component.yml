@@ -2,3 +2,8 @@
 dependencies:
   # Required ESP-IDF version (PlatformIO uses ESP-IDF 5.5.x here)
   idf: '>=5.0'
+  espressif/led_strip: "^2.4.1"
+  espressif/ds18b20: "^0.2.0"
+  espressif/aht20: "^2.0.0"
+  espressif/sht3x: "^0.2.0"
+  espressif/bme280: "^0.1.1"

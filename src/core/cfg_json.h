@@ -1,21 +1,28 @@
 #pragma once
-#include "esp_err.h"
+
 #include "cJSON.h"
+#include "esp_err.h"
 
-// Возвращает "живой" указатель на текущий конфиг (не освобождать!)
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 const cJSON *cfg_json_get(void);
+const char *cfg_json_last_error(void);
 
-// Перечитать из NVS (или установить дефолт)
 esp_err_t cfg_json_load_or_default(void);
-
-// Сохранить новый конфиг (копирует JSON внутрь)
 esp_err_t cfg_json_set_and_save(const cJSON *new_cfg);
-
-// Применить дефолт и сохранить
 esp_err_t cfg_json_reset_to_default(void);
 
-// Принудительный профиль "одно реле на GPIO12"
+// Compatibility no-op kept so older call sites don't force a legacy profile anymore.
 esp_err_t cfg_json_force_relay_gpio12_profile(void);
 
-// Factory reset: стереть namespace конфига
+// Clear only Wi-Fi and MQTT connection settings, keep device/peripheral config.
+esp_err_t cfg_json_clear_connectivity(void);
+
+// Full factory reset: erase config namespace.
 esp_err_t cfg_json_factory_reset(void);
+
+#ifdef __cplusplus
+}
+#endif

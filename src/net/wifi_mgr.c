@@ -57,7 +57,10 @@ static const char *jstr(const cJSON *o, const char *k, const char *def)
 
 static bool jhas_sta(const cJSON *cfg)
 {
-    const cJSON *net = jobj(cfg, "net");
+    const cJSON *net = jobj(cfg, "connectivity");
+    if (!cJSON_IsObject((cJSON *)net)) {
+        net = jobj(cfg, "net");
+    }
     const cJSON *sta = jobj(net, "sta");
     const char *ssid = jstr(sta, "ssid", "");
     return ssid && ssid[0] != 0;
@@ -537,7 +540,10 @@ esp_err_t wifi_mgr_start_from_cfg(const cJSON *cfg)
 {
     if (!cfg) return ESP_ERR_INVALID_ARG;
 
-    const cJSON *net = jobj(cfg, "net");
+    const cJSON *net = jobj(cfg, "connectivity");
+    if (!cJSON_IsObject((cJSON *)net)) {
+        net = jobj(cfg, "net");
+    }
     const cJSON *sta = jobj(net, "sta");
     const char *st_ssid = jstr(sta, "ssid", "");
     const char *st_pass = jstr(sta, "pass", "");

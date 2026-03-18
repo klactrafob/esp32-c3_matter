@@ -29,7 +29,6 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(cfg_json_load_or_default());
-    ESP_ERROR_CHECK(cfg_json_force_relay_gpio12_profile());
     ESP_ERROR_CHECK(app_watchdog_ensure_init());
     device_state_init();
     ESP_ERROR_CHECK(modules_init());
