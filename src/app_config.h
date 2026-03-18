@@ -4,11 +4,11 @@
 #define APP_AP_PASS_DEFAULT   ""
 #define APP_HOSTNAME_DEFAULT  "esp32-c3"
 
-// ===== Factory reset button =====
-#define APP_RESET_BTN_GPIO          9        // выбери свободный GPIO на своей плате
-#define APP_RESET_BTN_ACTIVE_LEVEL  0        // 0 если кнопка на GND (pull-up), 1 если на 3.3V (pull-down)
-#define APP_RESET_HOLD_MS           6000     // удержание 6 секунд
+// Factory reset button
+#define APP_RESET_BTN_GPIO          9
+#define APP_RESET_BTN_ACTIVE_LEVEL  0
+#define APP_RESET_HOLD_MS           10000
 #define APP_RESET_DEBOUNCE_MS       40
 
-// ===== Captive portal =====
+// Captive portal
 #define APP_CAPTIVE_PORTAL_ENABLE   1

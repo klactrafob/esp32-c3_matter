@@ -19,26 +19,19 @@
 
 static const char *TAG = "wifi";
 
-#define STA_RETRY_PERIOD_MS       5000
-#define STA_TO_AP_FALLBACK_MS     8000
-#define WIFI_MONITOR_PERIOD_MS    1000
-#define STA_SCAN_HOLD_WITH_AP_CLIENT_MS 30000
+#define STA_RETRY_PERIOD_MS    60000
+#define WIFI_MONITOR_PERIOD_MS 1000
 
 static bool s_is_ap = false;
 static bool s_sta_configured = false;
-static bool s_ap_fallback_on = false;
 static bool s_ap_always_on = false;
 static volatile bool s_sta_has_ip = false;
-static volatile int64_t s_sta_last_ok_us = 0;
 static volatile int64_t s_sta_last_try_us = 0;
-static volatile uint32_t s_ap_client_count = 0;
-static volatile int64_t s_ap_last_client_evt_us = 0;
 static TaskHandle_t s_wifi_mon_task = NULL;
 static bool s_wifi_handlers_registered = false;
 static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
 static volatile bool s_ap_restore_pending = false;
-static volatile bool s_ap_restore_enabled = true;
 
 static char s_ap_ssid[33] = {0};
 static wifi_config_t s_ap_cfg = {0};
@@ -48,14 +41,6 @@ bool wifi_mgr_is_ap(void) { return s_is_ap; }
 const char *wifi_mgr_get_ap_ssid(void) { return s_ap_ssid; }
 bool wifi_mgr_sta_configured(void) { return s_sta_configured; }
 bool wifi_mgr_sta_has_ip(void) { return s_sta_has_ip; }
-void wifi_mgr_set_ap_restore_enabled(bool enabled)
-{
-    s_ap_restore_enabled = enabled;
-    if (!enabled) {
-        s_ap_restore_pending = false;
-    }
-    ESP_LOGI(TAG, "AP auto-restore: %s", enabled ? "enabled" : "disabled");
-}
 
 static const cJSON *jobj(const cJSON *o, const char *k)
 {
@@ -134,37 +119,6 @@ static void fill_sta_cfg(const char *ssid, const char *pass)
     s_sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 }
 
-static void enable_ap_fallback(void)
-{
-    if (s_ap_fallback_on) return;
-
-    ESP_LOGW(TAG, "STA unavailable, switching to AP fallback: %s", s_ap_ssid);
-
-    if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK) return;
-    if (esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg) != ESP_OK) return;
-
-    s_ap_fallback_on = true;
-    s_is_ap = true;
-#if APP_CAPTIVE_PORTAL_ENABLE
-    dns_server_start();
-#endif
-}
-
-static void disable_ap_fallback(void)
-{
-    if (s_ap_always_on) return;
-    if (!s_ap_fallback_on) return;
-
-    ESP_LOGI(TAG, "STA restored, disabling AP fallback");
-
-#if APP_CAPTIVE_PORTAL_ENABLE
-    dns_server_stop();
-#endif
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    s_ap_fallback_on = false;
-    s_is_ap = false;
-}
-
 static void ensure_ap_dhcp_server_started(void)
 {
     if (!s_ap_netif) return;
@@ -176,7 +130,6 @@ static void ensure_ap_dhcp_server_started(void)
 
 static void ensure_ap_remains_enabled(void)
 {
-    if (!s_ap_restore_enabled) return;
     if (!s_ap_always_on) return;
 
     wifi_mode_t mode = WIFI_MODE_NULL;
@@ -188,9 +141,9 @@ static void ensure_ap_remains_enabled(void)
         return;
     }
 
-    ESP_LOGW(TAG, "AP disabled externally (mode=%d), restoring APSTA", (int)mode);
+    ESP_LOGW(TAG, "AP disabled externally (mode=%d), restoring AP", (int)mode);
 
-    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    err = esp_wifi_set_mode(WIFI_MODE_AP);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "restore AP mode failed: %s", esp_err_to_name(err));
         return;
@@ -208,57 +161,12 @@ static void ensure_ap_remains_enabled(void)
         return;
     }
 
-    if (s_sta_configured) {
-        (void)esp_wifi_set_config(WIFI_IF_STA, &s_sta_cfg);
-        (void)esp_wifi_connect();
-    }
-
-    s_ap_fallback_on = true;
     s_is_ap = true;
     ensure_ap_dhcp_server_started();
 #if APP_CAPTIVE_PORTAL_ENABLE
     dns_server_start();
 #endif
     s_ap_restore_pending = false;
-}
-
-static bool sta_target_available(void)
-{
-    wifi_scan_config_t scan_cfg = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = true,
-    };
-
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "scan start failed: %s", esp_err_to_name(err));
-        return true;
-    }
-
-    uint16_t ap_count = 0;
-    if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK || ap_count == 0) {
-        return false;
-    }
-
-    uint16_t rec_count = ap_count;
-    wifi_ap_record_t *records = (wifi_ap_record_t *)calloc(rec_count, sizeof(wifi_ap_record_t));
-    if (!records) return false;
-
-    bool found = false;
-    if (esp_wifi_scan_get_ap_records(&rec_count, records) == ESP_OK) {
-        const char *target = (const char *)s_sta_cfg.sta.ssid;
-        for (uint16_t i = 0; i < rec_count; ++i) {
-            if (strcmp((const char *)records[i].ssid, target) == 0) {
-                found = true;
-                break;
-            }
-        }
-    }
-
-    free(records);
-    return found;
 }
 
 static int compare_ap_record_rssi_desc(const void *a, const void *b)
@@ -432,11 +340,10 @@ static void wifi_monitor_task(void *arg)
     app_watchdog_register_current_task("wifi_mon");
 
     const int64_t retry_us = (int64_t)STA_RETRY_PERIOD_MS * 1000;
-    const int64_t fallback_us = (int64_t)STA_TO_AP_FALLBACK_MS * 1000;
 
     while (1) {
         int64_t now_us = esp_timer_get_time();
-        if (s_ap_restore_enabled && (s_ap_restore_pending || s_ap_always_on)) {
+        if (s_ap_restore_pending || s_ap_always_on) {
             ensure_ap_remains_enabled();
         }
 
@@ -447,42 +354,16 @@ static void wifi_monitor_task(void *arg)
         }
 
         if (s_sta_has_ip) {
-            s_sta_last_ok_us = now_us;
-            if (s_ap_fallback_on) disable_ap_fallback();
+            s_is_ap = false;
         } else {
-            bool hold_scan_for_ap_client = s_ap_fallback_on &&
-                                           (s_ap_client_count > 0) &&
-                                           ((now_us - s_ap_last_client_evt_us) <
-                                            ((int64_t)STA_SCAN_HOLD_WITH_AP_CLIENT_MS * 1000));
-
-            if (hold_scan_for_ap_client) {
-                app_watchdog_reset_current_task("wifi_mon");
-                vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_PERIOD_MS));
-                continue;
-            }
-
             if ((now_us - s_sta_last_try_us) >= retry_us) {
-                bool can_connect = true;
-                if (s_ap_fallback_on) {
-                    app_watchdog_reset_current_task("wifi_mon");
-                    can_connect = sta_target_available();
-                    app_watchdog_reset_current_task("wifi_mon");
-                    if (!can_connect) {
-                        ESP_LOGI(TAG, "STA SSID not visible yet, keep AP fallback");
-                    }
-                }
-
-                esp_err_t err = can_connect ? esp_wifi_connect() : ESP_FAIL;
+                s_sta_last_try_us = now_us;
+                esp_err_t err = esp_wifi_connect();
                 if (err == ESP_OK || err == ESP_ERR_WIFI_CONN) {
-                    s_sta_last_try_us = now_us;
                     ESP_LOGI(TAG, "STA reconnect attempt...");
-                } else if (!can_connect) {
-                    s_sta_last_try_us = now_us;
+                } else {
+                    ESP_LOGW(TAG, "STA reconnect attempt failed: %s", esp_err_to_name(err));
                 }
-            }
-
-            if (!s_ap_fallback_on && (now_us - s_sta_last_ok_us) >= fallback_us) {
-                enable_ap_fallback();
             }
         }
 
@@ -505,32 +386,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ESP_LOGI(TAG, "AP interface started");
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STOP) {
         ESP_LOGW(TAG, "AP interface stopped");
-        if (s_ap_restore_enabled && s_ap_always_on) {
+        if (s_ap_always_on) {
             s_ap_restore_pending = true;
         }
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
-        s_ap_client_count++;
-        s_ap_last_client_evt_us = esp_timer_get_time();
-        const wifi_event_ap_staconnected_t *ev = (const wifi_event_ap_staconnected_t *)data;
-        ESP_LOGI(TAG, "AP client joined: " MACSTR " aid=%d", MAC2STR(ev->mac), ev->aid);
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
-        if (s_ap_client_count > 0) s_ap_client_count--;
-        s_ap_last_client_evt_us = esp_timer_get_time();
-        const wifi_event_ap_stadisconnected_t *ev = (const wifi_event_ap_stadisconnected_t *)data;
-        ESP_LOGI(TAG, "AP client left: " MACSTR " aid=%d", MAC2STR(ev->mac), ev->aid);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *ev = (const wifi_event_sta_disconnected_t *)data;
         s_sta_has_ip = false;
 
         if (s_sta_configured) {
             s_sta_last_try_us = esp_timer_get_time();
-            ESP_LOGW(TAG, "STA disconnected (reason=%d), retry...", ev ? ev->reason : -1);
-            esp_wifi_connect();
+            ESP_LOGW(TAG, "STA disconnected (reason=%d), next retry in %d sec",
+                     ev ? ev->reason : -1, STA_RETRY_PERIOD_MS / 1000);
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t*)data;
         s_sta_has_ip = true;
-        s_sta_last_ok_us = esp_timer_get_time();
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
         s_sta_has_ip = false;
@@ -591,8 +461,8 @@ static esp_err_t start_ap_only(const char *ssid, const char *pass)
 
     s_sta_configured = false;
     s_sta_has_ip = false;
-    s_ap_fallback_on = false;
     s_ap_always_on = true;
+    s_ap_restore_pending = false;
     s_is_ap = true;
 
     fill_ap_cfg(ssid, pass);
@@ -624,27 +494,23 @@ static esp_err_t start_ap_only(const char *ssid, const char *pass)
     return ESP_OK;
 }
 
-static esp_err_t start_sta_with_fallback(const char *sta_ssid, const char *sta_pass,
-                                         const char *ap_ssid, const char *ap_pass)
+static esp_err_t start_sta_only(const char *sta_ssid, const char *sta_pass)
 {
     esp_err_t err = ESP_OK;
 
     s_sta_configured = true;
     s_sta_has_ip = false;
-    s_ap_fallback_on = false;
     s_ap_always_on = false;
+    s_ap_restore_pending = false;
     s_is_ap = false;
 
     fill_sta_cfg(sta_ssid, sta_pass);
-    fill_ap_cfg(ap_ssid, ap_pass);
 
-    ESP_LOGI(TAG, "Starting STA with AP fallback; STA SSID: %s", sta_ssid);
-    ESP_LOGI(TAG, "AP available during STA mode: %s", s_ap_ssid);
+    ESP_LOGI(TAG, "Starting STA-only mode; STA SSID: %s", sta_ssid);
 
     err = ensure_netif_event_loop();
     if (err != ESP_OK) return err;
     ensure_default_wifi_netif_sta();
-    ensure_default_wifi_netif_ap(); // keep AP netif ready for runtime fallback
     err = init_common_wifi();
     if (err != ESP_OK) return err;
 
@@ -655,10 +521,9 @@ static esp_err_t start_sta_with_fallback(const char *sta_ssid, const char *sta_p
     err = esp_wifi_start();
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
 
-    ESP_LOGI(TAG, "STA started. AP fallback prepared: %s", s_ap_ssid);
+    ESP_LOGI(TAG, "STA started. AP fallback disabled for configured device");
 
-    s_sta_last_ok_us = esp_timer_get_time();
-    s_sta_last_try_us = 0;
+    s_sta_last_try_us = esp_timer_get_time();
 
     if (s_wifi_mon_task == NULL) {
         BaseType_t ok = xTaskCreate(wifi_monitor_task, "wifi_mon", 3072, NULL, 5, &s_wifi_mon_task);
@@ -673,17 +538,16 @@ esp_err_t wifi_mgr_start_from_cfg(const cJSON *cfg)
     if (!cfg) return ESP_ERR_INVALID_ARG;
 
     const cJSON *net = jobj(cfg, "net");
-    const cJSON *ap  = jobj(net, "ap");
     const cJSON *sta = jobj(net, "sta");
-
-    const char *ap_ssid = jstr(ap, "ssid", APP_AP_SSID_DEFAULT);
-    const char *ap_pass = jstr(ap, "pass", APP_AP_PASS_DEFAULT);
     const char *st_ssid = jstr(sta, "ssid", "");
     const char *st_pass = jstr(sta, "pass", "");
 
     if (jhas_sta(cfg)) {
-        return start_sta_with_fallback(st_ssid, st_pass, ap_ssid, ap_pass);
+        return start_sta_only(st_ssid, st_pass);
     }
+    const cJSON *ap  = jobj(net, "ap");
+    const char *ap_ssid = jstr(ap, "ssid", APP_AP_SSID_DEFAULT);
+    const char *ap_pass = jstr(ap, "pass", APP_AP_PASS_DEFAULT);
     return start_ap_only(ap_ssid, ap_pass);
 }
 
@@ -701,9 +565,6 @@ esp_err_t wifi_mgr_restart_from_cfg(const cJSON *cfg)
 #endif
 
     s_ap_restore_pending = false;
-    s_ap_restore_enabled = true;
-    s_ap_client_count = 0;
-    s_ap_last_client_evt_us = esp_timer_get_time();
 
     vTaskDelay(pdMS_TO_TICKS(80));
     return wifi_mgr_start_from_cfg(cfg);
