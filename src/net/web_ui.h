@@ -97,7 +97,7 @@ static const char *WEB_INDEX_HTML =
 "const BOARD_PROFILE_LABELS={'esp32-c3-supermini':{ru:'ESP32-C3 Super Mini',en:'ESP32-C3 Super Mini'},'esp32-c3-luatos':{ru:'ESP32-C3 LuatOS',en:'ESP32-C3 LuatOS'},'esp32-c3-devkitm-1':{ru:'ESP32-C3 DevKitM-1',en:'ESP32-C3 DevKitM-1'}};"
 "const BOARD_HINTS={'esp32-c3-supermini':{ru:'Рекомендуемый профиль по умолчанию. В этой прошивке безопасный пул GPIO уже ограничен под типовой ESP32-C3 проект.',en:'Recommended default profile. This firmware already limits GPIO selection to a safe ESP32-C3 subset.'},'esp32-c3-luatos':{ru:'Профиль для ваших LuatOS-плат. Если разводка проекта отличается, всё равно ориентируйтесь на фактические GPIO устройства.',en:'Profile for your LuatOS boards. If your hardware wiring differs, use the actual GPIO mapping of the device.'},'esp32-c3-devkitm-1':{ru:'Совместимый профиль для классической devkit-платы. Можно использовать как запасной шаблон.',en:'Compatible profile for the classic devkit board. Useful as a fallback template.'}};"
 "let cfg=null;let lang=localStorage.getItem('ui_lang')||'ru';"
-"function esc(v){return String(v==null?'':v).replace(/[&<>\\\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\\\"'\\\":'&#39;'}[m]));}"
+"function esc(v){return String(v==null?'':v).replace(/[&<>\\\"']/g,m=>{if(m==='&')return '&amp;';if(m==='<')return '&lt;';if(m==='>')return '&gt;';if(m==='\\\"')return '&quot;';return '&#39;';});}"
 "function pick(v,d){return v===undefined||v===null?d:v;}"
 "function t(k){return(I18N[lang]&&I18N[lang][k])||(I18N.en&&I18N.en[k])||k;}"
 "function fmt(s,data){return String(s).replace(/\\\\{(\\\\w+)\\\\}/g,(_,k)=>data&&data[k]!==undefined?data[k]:'');}"
