@@ -19,13 +19,33 @@ static const char *NVS_KEY = "json";
 #define CFG_MAX_INPUTS_AND_BUTTONS 8
 #define CFG_MAX_SENSORS 4
 
-static const int s_allowed_gpios[] = {0, 1, 3, 4, 5, 6, 7, 10};
+static const int s_conservative_board_gpios[] = {0, 1, 3, 4, 5, 6, 7, 10};
+static const int s_luatos_board_gpios[] = {0, 1, 3, 4, 5, 6, 7, 10, 12, 13};
 
 static const char *BOARD_PROFILE = "esp32-c3-supermini";
 static const char *MQTT_DISCOVERY_PREFIX_DEFAULT = "homeassistant";
 static const char *DEVICE_NAME_DEFAULT = "ESP32 C3 MQTT Device";
 static const char *HOSTNAME_DEFAULT = "esp32-c3";
 static const char *AP_SSID_DEFAULT = "ESP32-SETUP";
+
+typedef struct {
+    const char *profile;
+    const int *gpios;
+    size_t gpio_count;
+} board_gpio_policy_t;
+
+static const board_gpio_policy_t s_board_gpio_policies[] = {
+    {
+        .profile = "esp32-c3-supermini",
+        .gpios = s_conservative_board_gpios,
+        .gpio_count = sizeof(s_conservative_board_gpios) / sizeof(s_conservative_board_gpios[0]),
+    },
+    {
+        .profile = "esp32-c3-luatos",
+        .gpios = s_luatos_board_gpios,
+        .gpio_count = sizeof(s_luatos_board_gpios) / sizeof(s_luatos_board_gpios[0]),
+    },
+};
 
 static cJSON *s_cfg = NULL;
 static char s_last_error[192] = "";
@@ -40,6 +60,7 @@ typedef struct {
     gpio_reservation_t pins[32];
     char ids[32][24];
     int id_count;
+    char board_profile[32];
     bool i2c_bus_seen;
     int i2c_sda;
     int i2c_scl;
@@ -192,10 +213,38 @@ static void sanitize_id_copy(char *dst, size_t dst_len, const char *src, const c
     }
 }
 
-static bool is_gpio_allowed(int gpio)
+static const char *normalize_board_profile_value(const char *profile)
 {
-    for (size_t i = 0; i < sizeof(s_allowed_gpios) / sizeof(s_allowed_gpios[0]); ++i) {
-        if (s_allowed_gpios[i] == gpio) {
+    if (!profile || profile[0] == 0) {
+        return BOARD_PROFILE;
+    }
+
+    for (size_t i = 0; i < sizeof(s_board_gpio_policies) / sizeof(s_board_gpio_policies[0]); ++i) {
+        if (strcmp(s_board_gpio_policies[i].profile, profile) == 0) {
+            return s_board_gpio_policies[i].profile;
+        }
+    }
+
+    return BOARD_PROFILE;
+}
+
+static const board_gpio_policy_t *get_board_gpio_policy(const char *profile)
+{
+    const char *normalized = normalize_board_profile_value(profile);
+    for (size_t i = 0; i < sizeof(s_board_gpio_policies) / sizeof(s_board_gpio_policies[0]); ++i) {
+        if (strcmp(s_board_gpio_policies[i].profile, normalized) == 0) {
+            return &s_board_gpio_policies[i];
+        }
+    }
+
+    return &s_board_gpio_policies[0];
+}
+
+static bool is_gpio_allowed_for_profile(const char *profile, int gpio)
+{
+    const board_gpio_policy_t *policy = get_board_gpio_policy(profile);
+    for (size_t i = 0; i < policy->gpio_count; ++i) {
+        if (policy->gpios[i] == gpio) {
             return true;
         }
     }
@@ -237,8 +286,8 @@ static bool reserve_gpio(cfg_validation_t *ctx, int gpio, const char *owner, con
         set_error("%s uses invalid GPIO%d", owner, gpio);
         return false;
     }
-    if (!is_gpio_allowed(gpio)) {
-        set_error("%s uses forbidden GPIO%d", owner, gpio);
+    if (!is_gpio_allowed_for_profile(ctx->board_profile, gpio)) {
+        set_error("%s uses forbidden GPIO%d for board profile %s", owner, gpio, ctx->board_profile);
         return false;
     }
 
@@ -379,7 +428,8 @@ static cJSON *normalize_config(const cJSON *src)
 
     const char *device_name = jstr(src_device, "name",
                                    jstr(src_mqtt, "device_name", DEVICE_NAME_DEFAULT));
-    const char *board_profile = jstr(src_device, "board_profile", BOARD_PROFILE);
+    const char *board_profile = normalize_board_profile_value(
+        jstr(src_device, "board_profile", BOARD_PROFILE));
     const char *saved_node_id = jstr(src_device, "node_id", node_id);
     if (!saved_node_id[0]) {
         saved_node_id = node_id;
@@ -421,6 +471,7 @@ static cJSON *normalize_config(const cJSON *src)
         set_error("Out of memory while validating config");
         return NULL;
     }
+    snprintf(ctx->board_profile, sizeof(ctx->board_profile), "%s", board_profile);
 
     const cJSON *src_outputs = src_is_v2 ? jobj(src, "outputs") : NULL;
     if (cJSON_IsArray((cJSON *)src_outputs)) {

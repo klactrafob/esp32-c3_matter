@@ -280,14 +280,27 @@ static esp_err_t handle_get_runtime(httpd_req_t *req)
 static esp_err_t handle_wifi_scan(httpd_req_t *req)
 {
     cJSON *networks = NULL;
-    esp_err_t err = wifi_mgr_scan_networks(&networks);
     bool cached = false;
-    if (err != ESP_OK) {
-        err = wifi_mgr_get_cached_scan_networks(&networks);
-        if (err != ESP_OK) {
-            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan failed");
+
+    // When the UI is opened via the device AP, prefer the pre-scan cache.
+    // Trying to perform a live scan first may disrupt the very request that
+    // asked for the network list.
+    if (wifi_mgr_is_ap()) {
+        esp_err_t cache_err = wifi_mgr_get_cached_scan_networks(&networks);
+        if (cache_err == ESP_OK) {
+            cached = true;
         }
-        cached = true;
+    }
+
+    if (!networks) {
+        esp_err_t err = wifi_mgr_scan_networks(&networks);
+        if (err != ESP_OK) {
+            err = wifi_mgr_get_cached_scan_networks(&networks);
+            if (err != ESP_OK) {
+                return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan failed");
+            }
+            cached = true;
+        }
     }
 
     cJSON *resp = cJSON_CreateObject();
