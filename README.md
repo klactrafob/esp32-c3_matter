@@ -1,83 +1,84 @@
-# ESP32-C3 MQTT Relay (1 channel)
+# ESP32-C3 MQTT
 
-Прошивка переделана под базовое устройство для Home Assistant через MQTT.
+Универсальная MQTT-прошивка для ESP32-C3 с веб-конфигуратором, Wi-Fi setup portal и интеграцией с Home Assistant через MQTT Discovery.
 
-## Что делает сейчас
+Проект ориентирован в первую очередь на `ESP32-C3 Super Mini`, но также подходит для `ESP32-C3 LuatOS` и совместимых плат ESP32-C3.
 
-- Управляет одним реле (по умолчанию GPIO12).
-- Подключается к MQTT-брокеру.
-- Публикует состояние реле (`ON`/`OFF`).
-- Принимает команду реле (`ON`/`OFF`/`TOGGLE`).
-- Публикует MQTT Discovery для Home Assistant (тип `switch`).
-- Сохраняет настройки в NVS (`/api/config`) и применяет через `/api/apply`.
+## Что умеет
 
-## MQTT топики
+- Настраиваемые выходы: `relay`, `pwm`, `ws2812`
+- Настраиваемые входы и кнопки в едином редакторе
+- Поддержка датчиков: `ds18b20_bus`, `aht20`, `sht3x`, `bme280`
+- Wi-Fi клиент + точка доступа для первичной настройки
+- Автосканирование Wi-Fi и кэш результатов сканирования
+- Веб-интерфейс с переключением `RU/EN`
+- MQTT Discovery для Home Assistant
+- Хранение конфигурации в NVS через `/api/config` и применение через `/api/apply`
 
-По умолчанию (`topic_prefix = esp32-c3/relay1`):
+## Сценарий первого запуска
 
-- Команда: `esp32-c3/relay1/relay/set`
-- Состояние: `esp32-c3/relay1/relay/state`
-- Доступность: `esp32-c3/relay1/status`
+1. Если Wi-Fi ещё не настроен, устройство сначала сканирует доступные сети.
+2. Затем поднимает точку доступа вида `ESP32-SETUP-XXXXXX`.
+3. Откройте веб-интерфейс по адресу `http://192.168.4.1`.
+4. Задайте параметры Wi-Fi, MQTT и конфигурацию GPIO.
+5. Сохраните настройки и примените их.
 
-Discovery topic:
+## MQTT
 
-- `homeassistant/switch/<node_id>/relay/config`
-
-## Конфиг MQTT в JSON
-
-Секция `mqtt` в `/api/config`:
+Основные параметры задаются в разделе `connectivity.mqtt` конфигурации:
 
 ```json
 {
-  "mqtt": {
-    "enable": true,
-    "host": "192.168.1.10",
-    "port": 1883,
-    "user": "",
-    "pass": "",
-    "client_id": "",
-    "topic_prefix": "esp32-c3/relay1",
-    "discovery_prefix": "homeassistant",
-    "device_name": "ESP32 C3 Relay",
-    "discovery": true,
-    "retain": true
+  "connectivity": {
+    "mqtt": {
+      "enable": true,
+      "host": "192.168.1.10",
+      "port": 1883,
+      "user": "",
+      "pass": "",
+      "client_id": "",
+      "topic_prefix": "",
+      "discovery_prefix": "homeassistant",
+      "discovery": true,
+      "retain": true
+    }
   }
 }
 ```
 
 Примечания:
 
-- `host` может быть именем/IPv4 (`192.168.1.10`) или полным URI (`mqtt://192.168.1.10:1883`).
-- Если `client_id` пустой, берется `esp32c3-<MAC>`.
-- После изменения конфига вызывайте `/api/apply`.
+- `host` может быть IPv4, DNS-именем или URI вида `mqtt://192.168.1.10:1883`
+- если `client_id` пустой, используется `esp32c3-<MAC>`
+- после изменения конфигурации вызывайте `/api/apply`
 
 ## Home Assistant
 
-1. Убедитесь, что в HA включен MQTT integration.
-2. В конфиге устройства укажите `mqtt.host` и при необходимости `user/pass`.
-3. Выполните `POST /api/apply`.
-4. После подключения устройство автоматически появится в HA через MQTT Discovery.
+1. Включите MQTT integration в Home Assistant.
+2. Укажите `connectivity.mqtt.host` и при необходимости `user/pass`.
+3. Сохраните конфигурацию и выполните `POST /api/apply`.
+4. После подключения сущности появятся в Home Assistant через MQTT Discovery.
 
-## Сборка
+## Сборка через ESP-IDF
 
 ```bat
-pio run
+idf.py build
 ```
 
 ## Прошивка
 
 ```bat
-pio run -t upload
+idf.py -p COM8 flash
 ```
 
-## Монитор порта
+## Монитор
 
 ```bat
-pio device monitor
+idf.py -p COM8 monitor
 ```
 
-## Полная очистка flash
+## Сборка через PlatformIO
 
 ```bat
-flash_clean.bat COM4
+pio run
 ```

@@ -21,7 +21,7 @@ static const char *NVS_KEY = "json";
 
 static const int s_allowed_gpios[] = {0, 1, 3, 4, 5, 6, 7, 10};
 
-static const char *BOARD_PROFILE = "esp32-c3-devkitm-1";
+static const char *BOARD_PROFILE = "esp32-c3-supermini";
 static const char *MQTT_DISCOVERY_PREFIX_DEFAULT = "homeassistant";
 static const char *DEVICE_NAME_DEFAULT = "ESP32 C3 MQTT Device";
 static const char *HOSTNAME_DEFAULT = "esp32-c3";
@@ -302,6 +302,19 @@ static cJSON *create_empty_schema(void)
     return root;
 }
 
+static cJSON *normalize_cleanup_and_fail(cJSON *root, cfg_validation_t *ctx)
+{
+    free(ctx);
+    cJSON_Delete(root);
+    return NULL;
+}
+
+static cJSON *normalize_cleanup_success(cJSON *root, cfg_validation_t *ctx)
+{
+    free(ctx);
+    return root;
+}
+
 static bool append_action_json(cJSON *dst_parent, const char *key, const cJSON *src_action)
 {
     cJSON *dst = cJSON_AddObjectToObject(dst_parent, key);
@@ -402,15 +415,19 @@ static cJSON *normalize_config(const cJSON *src)
     cJSON_ReplaceItemInObject(mqtt, "discovery", cJSON_CreateBool(jbool(src_mqtt, "discovery", true)));
     cJSON_ReplaceItemInObject(mqtt, "retain", cJSON_CreateBool(jbool(src_mqtt, "retain", true)));
 
-    cfg_validation_t ctx = {0};
+    cfg_validation_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        cJSON_Delete(root);
+        set_error("Out of memory while validating config");
+        return NULL;
+    }
 
     const cJSON *src_outputs = src_is_v2 ? jobj(src, "outputs") : NULL;
     if (cJSON_IsArray((cJSON *)src_outputs)) {
         int count = cJSON_GetArraySize((cJSON *)src_outputs);
         if (count > CFG_MAX_OUTPUTS) {
-            cJSON_Delete(root);
             set_error("Too many outputs: max %d", CFG_MAX_OUTPUTS);
-            return NULL;
+            return normalize_cleanup_and_fail(root, ctx);
         }
 
         for (int i = 0; i < count; ++i) {
@@ -421,24 +438,21 @@ static cJSON *normalize_config(const cJSON *src)
 
             char id[24] = {0};
             sanitize_id_copy(id, sizeof(id), jstr(item, "id", ""), "out", i + 1);
-            if (!register_id(&ctx, id)) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!register_id(ctx, id)) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             const char *type = jstr(item, "type", "relay");
             if (strcmp(type, "relay") != 0 && strcmp(type, "pwm") != 0 && strcmp(type, "ws2812") != 0) {
-                cJSON_Delete(root);
                 set_error("Output %s uses unsupported type '%s'", id, type);
-                return NULL;
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             int gpio = jint(item, "gpio", -1);
             char owner[40] = {0};
             snprintf(owner, sizeof(owner), "output:%s", id);
-            if (!reserve_gpio(&ctx, gpio, owner, "")) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!reserve_gpio(ctx, gpio, owner, "")) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             cJSON *dst = cJSON_CreateObject();
@@ -489,13 +503,11 @@ static cJSON *normalize_config(const cJSON *src)
         const cJSON *legacy_relay = jobj(legacy_modules, "relay");
         if (cJSON_IsObject((cJSON *)legacy_relay) && jbool(legacy_relay, "enable", true)) {
             int gpio = jint(legacy_relay, "gpio", 4);
-            if (!reserve_gpio(&ctx, gpio, "output:relay1", "")) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!reserve_gpio(ctx, gpio, "output:relay1", "")) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
-            if (!register_id(&ctx, "relay1")) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!register_id(ctx, "relay1")) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
             cJSON *dst = cJSON_CreateObject();
             cJSON_AddStringToObject(dst, "id", "relay1");
@@ -514,9 +526,8 @@ static cJSON *normalize_config(const cJSON *src)
     if (cJSON_IsArray((cJSON *)src_inputs)) {
         input_count = cJSON_GetArraySize((cJSON *)src_inputs);
         if (input_count > CFG_MAX_INPUTS_AND_BUTTONS) {
-            cJSON_Delete(root);
             set_error("Too many inputs: max %d", CFG_MAX_INPUTS_AND_BUTTONS);
-            return NULL;
+            return normalize_cleanup_and_fail(root, ctx);
         }
 
         for (int i = 0; i < input_count; ++i) {
@@ -527,17 +538,15 @@ static cJSON *normalize_config(const cJSON *src)
 
             char id[24] = {0};
             sanitize_id_copy(id, sizeof(id), jstr(item, "id", ""), "in", i + 1);
-            if (!register_id(&ctx, id)) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!register_id(ctx, id)) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             int gpio = jint(item, "gpio", -1);
             char owner[40] = {0};
             snprintf(owner, sizeof(owner), "input:%s", id);
-            if (!reserve_gpio(&ctx, gpio, owner, "")) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!reserve_gpio(ctx, gpio, owner, "")) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             const char *role = jstr(item, "role", "generic_binary");
@@ -546,16 +555,14 @@ static cJSON *normalize_config(const cJSON *src)
                 strcmp(role, "contact") != 0 &&
                 strcmp(role, "limit") != 0 &&
                 strcmp(role, "generic_binary") != 0) {
-                cJSON_Delete(root);
                 set_error("Input %s uses unsupported role '%s'", id, role);
-                return NULL;
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             const char *pull = jstr(item, "pull", "up");
             if (strcmp(pull, "up") != 0 && strcmp(pull, "down") != 0 && strcmp(pull, "none") != 0) {
-                cJSON_Delete(root);
                 set_error("Input %s uses unsupported pull '%s'", id, pull);
-                return NULL;
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             cJSON *dst = cJSON_CreateObject();
@@ -576,9 +583,8 @@ static cJSON *normalize_config(const cJSON *src)
     if (cJSON_IsArray((cJSON *)src_buttons)) {
         button_count = cJSON_GetArraySize((cJSON *)src_buttons);
         if ((button_count + input_count) > CFG_MAX_INPUTS_AND_BUTTONS) {
-            cJSON_Delete(root);
             set_error("Too many inputs/buttons combined: max %d", CFG_MAX_INPUTS_AND_BUTTONS);
-            return NULL;
+            return normalize_cleanup_and_fail(root, ctx);
         }
 
         for (int i = 0; i < button_count; ++i) {
@@ -589,24 +595,21 @@ static cJSON *normalize_config(const cJSON *src)
 
             char id[24] = {0};
             sanitize_id_copy(id, sizeof(id), jstr(item, "id", ""), "btn", i + 1);
-            if (!register_id(&ctx, id)) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!register_id(ctx, id)) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             int gpio = jint(item, "gpio", -1);
             char owner[40] = {0};
             snprintf(owner, sizeof(owner), "button:%s", id);
-            if (!reserve_gpio(&ctx, gpio, owner, "")) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!reserve_gpio(ctx, gpio, owner, "")) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             const char *pull = jstr(item, "pull", "up");
             if (strcmp(pull, "up") != 0 && strcmp(pull, "down") != 0 && strcmp(pull, "none") != 0) {
-                cJSON_Delete(root);
                 set_error("Button %s uses unsupported pull '%s'", id, pull);
-                return NULL;
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             cJSON *dst = cJSON_CreateObject();
@@ -622,9 +625,8 @@ static cJSON *normalize_config(const cJSON *src)
             const cJSON *src_actions = jobj(item, "actions");
             if (!append_action_json(actions, "short", jobj(src_actions, "short")) ||
                 !append_action_json(actions, "long", jobj(src_actions, "long"))) {
-                cJSON_Delete(root);
                 set_error("Out of memory while building button actions");
-                return NULL;
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             cJSON_AddItemToArray(buttons, dst);
@@ -636,9 +638,8 @@ static cJSON *normalize_config(const cJSON *src)
         int count = cJSON_GetArraySize((cJSON *)src_sensors);
         int ds18b20_bus_count = 0;
         if (count > CFG_MAX_SENSORS) {
-            cJSON_Delete(root);
             set_error("Too many sensors: max %d", CFG_MAX_SENSORS);
-            return NULL;
+            return normalize_cleanup_and_fail(root, ctx);
         }
 
         for (int i = 0; i < count; ++i) {
@@ -649,9 +650,8 @@ static cJSON *normalize_config(const cJSON *src)
 
             char id[24] = {0};
             sanitize_id_copy(id, sizeof(id), jstr(item, "id", ""), "sensor", i + 1);
-            if (!register_id(&ctx, id)) {
-                cJSON_Delete(root);
-                return NULL;
+            if (!register_id(ctx, id)) {
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             const char *type = jstr(item, "type", "");
@@ -659,9 +659,8 @@ static cJSON *normalize_config(const cJSON *src)
                 strcmp(type, "aht20") != 0 &&
                 strcmp(type, "sht3x") != 0 &&
                 strcmp(type, "bme280") != 0) {
-                cJSON_Delete(root);
                 set_error("Sensor %s uses unsupported type '%s'", id, type);
-                return NULL;
+                return normalize_cleanup_and_fail(root, ctx);
             }
 
             cJSON *dst = cJSON_CreateObject();
@@ -673,24 +672,21 @@ static cJSON *normalize_config(const cJSON *src)
             if (strcmp(type, "ds18b20_bus") == 0) {
                 ds18b20_bus_count++;
                 if (ds18b20_bus_count > 1) {
-                    cJSON_Delete(root);
                     set_error("Only one ds18b20_bus sensor entry is allowed");
-                    return NULL;
+                    return normalize_cleanup_and_fail(root, ctx);
                 }
                 int gpio = jint(item, "gpio", -1);
                 char owner[40] = {0};
                 snprintf(owner, sizeof(owner), "sensor:%s", id);
-                if (!reserve_gpio(&ctx, gpio, owner, "")) {
-                    cJSON_Delete(root);
-                    return NULL;
+                if (!reserve_gpio(ctx, gpio, owner, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
                 }
-                if (ctx.onewire_seen && ctx.onewire_gpio != gpio) {
-                    cJSON_Delete(root);
+                if (ctx->onewire_seen && ctx->onewire_gpio != gpio) {
                     set_error("DS18B20 sensors must share one OneWire bus");
-                    return NULL;
+                    return normalize_cleanup_and_fail(root, ctx);
                 }
-                ctx.onewire_seen = true;
-                ctx.onewire_gpio = gpio;
+                ctx->onewire_seen = true;
+                ctx->onewire_gpio = gpio;
 
                 cJSON_AddNumberToObject(dst, "gpio", gpio);
                 cJSON_AddNumberToObject(dst, "poll_interval_sec", jint(item, "poll_interval_sec", 30));
@@ -701,21 +697,19 @@ static cJSON *normalize_config(const cJSON *src)
                                                  strcmp(type, "sht3x") == 0 ? 0x44 : 0x76);
                 int freq = jint(item, "freq_hz", 100000);
 
-                if (!reserve_gpio(&ctx, sda, "i2c_sda", "i2c_sda") ||
-                    !reserve_gpio(&ctx, scl, "i2c_scl", "i2c_scl")) {
-                    cJSON_Delete(root);
-                    return NULL;
+                if (!reserve_gpio(ctx, sda, "i2c_sda", "i2c_sda") ||
+                    !reserve_gpio(ctx, scl, "i2c_scl", "i2c_scl")) {
+                    return normalize_cleanup_and_fail(root, ctx);
                 }
 
-                if (!ctx.i2c_bus_seen) {
-                    ctx.i2c_bus_seen = true;
-                    ctx.i2c_sda = sda;
-                    ctx.i2c_scl = scl;
-                    ctx.i2c_freq = freq;
-                } else if (ctx.i2c_sda != sda || ctx.i2c_scl != scl || ctx.i2c_freq != freq) {
-                    cJSON_Delete(root);
+                if (!ctx->i2c_bus_seen) {
+                    ctx->i2c_bus_seen = true;
+                    ctx->i2c_sda = sda;
+                    ctx->i2c_scl = scl;
+                    ctx->i2c_freq = freq;
+                } else if (ctx->i2c_sda != sda || ctx->i2c_scl != scl || ctx->i2c_freq != freq) {
                     set_error("All I2C sensors must share the same SDA/SCL/freq bus settings");
-                    return NULL;
+                    return normalize_cleanup_and_fail(root, ctx);
                 }
 
                 cJSON_AddNumberToObject(dst, "sda_gpio", sda);
@@ -729,7 +723,7 @@ static cJSON *normalize_config(const cJSON *src)
         }
     }
 
-    return root;
+    return normalize_cleanup_success(root, ctx);
 }
 
 static esp_err_t nvs_write_string(const char *s)

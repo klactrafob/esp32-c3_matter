@@ -281,12 +281,18 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
 {
     cJSON *networks = NULL;
     esp_err_t err = wifi_mgr_scan_networks(&networks);
+    bool cached = false;
     if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan failed");
+        err = wifi_mgr_get_cached_scan_networks(&networks);
+        if (err != ESP_OK) {
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan failed");
+        }
+        cached = true;
     }
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "cached", cached);
     cJSON_AddItemToObject(resp, "networks", networks);
     esp_err_t r = json_send(req, resp, 200);
     cJSON_Delete(resp);

@@ -32,15 +32,53 @@ static bool s_wifi_handlers_registered = false;
 static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
 static volatile bool s_ap_restore_pending = false;
+static cJSON *s_scan_cache = NULL;
 
 static char s_ap_ssid[33] = {0};
 static wifi_config_t s_ap_cfg = {0};
 static wifi_config_t s_sta_cfg = {0};
 
+static esp_err_t ensure_netif_event_loop(void);
+static void ensure_default_wifi_netif_ap(void);
+static void ensure_default_wifi_netif_sta(void);
+static esp_err_t init_common_wifi(void);
+static esp_err_t start_ap_only(const char *ssid, const char *pass);
+
 bool wifi_mgr_is_ap(void) { return s_is_ap; }
 const char *wifi_mgr_get_ap_ssid(void) { return s_ap_ssid; }
 bool wifi_mgr_sta_configured(void) { return s_sta_configured; }
 bool wifi_mgr_sta_has_ip(void) { return s_sta_has_ip; }
+
+static void replace_scan_cache(const cJSON *arr)
+{
+    cJSON *dup = arr ? cJSON_Duplicate((cJSON *)arr, 1) : NULL;
+    if (arr && !dup) {
+        return;
+    }
+    if (s_scan_cache) {
+        cJSON_Delete(s_scan_cache);
+    }
+    s_scan_cache = dup;
+}
+
+esp_err_t wifi_mgr_get_cached_scan_networks(cJSON **out_networks)
+{
+    if (!out_networks) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_networks = NULL;
+    if (!s_scan_cache) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    cJSON *dup = cJSON_Duplicate(s_scan_cache, 1);
+    if (!dup) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    *out_networks = dup;
+    return ESP_OK;
+}
 
 static const cJSON *jobj(const cJSON *o, const char *k)
 {
@@ -243,6 +281,7 @@ esp_err_t wifi_mgr_scan_networks(cJSON **out_networks)
 
     bool switched_ap_to_apsta = false;
     if (mode == WIFI_MODE_AP) {
+        ensure_default_wifi_netif_sta();
         err = esp_wifi_set_mode(WIFI_MODE_APSTA);
         if (err != ESP_OK) {
             cJSON_Delete(arr);
@@ -333,8 +372,52 @@ esp_err_t wifi_mgr_scan_networks(cJSON **out_networks)
         }
     }
 
+    replace_scan_cache(arr);
     *out_networks = arr;
     return ESP_OK;
+}
+
+static void preload_scan_cache_before_ap_start(void)
+{
+    esp_err_t err = ensure_netif_event_loop();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pre-scan skipped: netif init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ensure_default_wifi_netif_sta();
+    err = init_common_wifi();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pre-scan skipped: wifi init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pre-scan skipped: set STA mode failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        ESP_LOGW(TAG, "pre-scan skipped: wifi start failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    cJSON *networks = NULL;
+    err = wifi_mgr_scan_networks(&networks);
+    if (err == ESP_OK) {
+        int found = cJSON_GetArraySize(networks);
+        ESP_LOGI(TAG, "Pre-scanned %d Wi-Fi network(s) before enabling AP", found);
+        cJSON_Delete(networks);
+    } else {
+        ESP_LOGW(TAG, "pre-scan failed: %s", esp_err_to_name(err));
+    }
+
+    err = esp_wifi_stop();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGW(TAG, "pre-scan stop failed: %s", esp_err_to_name(err));
+    }
 }
 
 static void wifi_monitor_task(void *arg)
@@ -475,6 +558,7 @@ static esp_err_t start_ap_only(const char *ssid, const char *pass)
 
     err = ensure_netif_event_loop();
     if (err != ESP_OK) return err;
+    preload_scan_cache_before_ap_start();
     ensure_default_wifi_netif_ap();
     err = init_common_wifi();
     if (err != ESP_OK) return err;
