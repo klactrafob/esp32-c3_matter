@@ -11,6 +11,7 @@
 #include "ds18b20.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -40,7 +41,20 @@ typedef enum {
     OUTPUT_TYPE_RELAY,
     OUTPUT_TYPE_PWM,
     OUTPUT_TYPE_WS2812,
+    OUTPUT_TYPE_SERVO_3WIRE,
+    OUTPUT_TYPE_SERVO_5WIRE,
 } output_type_t;
+
+typedef enum {
+    WS2812_MODE_RGB = 0,
+    WS2812_MODE_MONO_TRIPLET,
+} ws2812_mode_t;
+
+typedef enum {
+    WS2812_TRANSITION_NONE = 0,
+    WS2812_TRANSITION_FADE,
+    WS2812_TRANSITION_WIPE,
+} ws2812_transition_style_t;
 
 typedef enum {
     ACTION_NONE = 0,
@@ -78,6 +92,9 @@ typedef struct {
             bool inverted;
             int freq_hz;
             int level;
+            int max_level_pct;
+            int power_relay_gpio;
+            int power_relay_active_level;
             ledc_channel_t channel;
             ledc_timer_t timer;
         } pwm;
@@ -89,8 +106,51 @@ typedef struct {
             uint8_t red;
             uint8_t green;
             uint8_t blue;
+            ws2812_mode_t mode;
+            ws2812_transition_style_t transition_style;
+            int transition_ms;
+            int applied_level;
+            uint8_t applied_red;
+            uint8_t applied_green;
+            uint8_t applied_blue;
+            bool transition_active;
+            bool transition_use_wipe;
+            int64_t transition_started_us;
+            int64_t transition_duration_us;
+            int start_level;
+            int target_level;
+            uint8_t start_red;
+            uint8_t start_green;
+            uint8_t start_blue;
+            uint8_t target_red;
+            uint8_t target_green;
+            uint8_t target_blue;
             led_strip_handle_t strip;
         } ws2812;
+        struct {
+            int level;
+            int min_us;
+            int max_us;
+            ledc_channel_t channel;
+            ledc_timer_t timer;
+        } servo_3wire;
+        struct {
+            int gpio_b;
+            int feedback_gpio;
+            int feedback_min_raw;
+            int feedback_max_raw;
+            int deadband_pct;
+            int move_timeout_ms;
+            bool reverse_direction;
+            adc_channel_t adc_channel;
+            int target_level;
+            int current_level;
+            int feedback_raw;
+            int drive_state;
+            bool moving;
+            bool timed_out;
+            int64_t drive_started_us;
+        } servo_5wire;
     } cfg;
 } output_runtime_t;
 
@@ -170,6 +230,12 @@ typedef struct {
 } ds18b20_bus_runtime_t;
 
 typedef struct {
+    bool active;
+    adc_oneshot_unit_handle_t handle;
+    uint32_t configured_mask;
+} adc_runtime_t;
+
+typedef struct {
     output_runtime_t outputs[MODULES_MAX_OUTPUTS];
     int output_count;
     input_runtime_t inputs[MODULES_MAX_INPUTS];
@@ -180,6 +246,7 @@ typedef struct {
     int sensor_count;
     i2c_runtime_t i2c;
     ds18b20_bus_runtime_t ds18b20;
+    adc_runtime_t adc;
 } modules_runtime_t;
 
 static modules_runtime_t s_runtime = {0};
@@ -196,6 +263,10 @@ static int jint(const cJSON *obj, const char *key, int def);
 static gpio_pull_mode_t pull_mode_from_text(const char *pull);
 static output_type_t output_type_from_text(const char *type);
 static const char *output_type_to_text(output_type_t type);
+static ws2812_mode_t ws2812_mode_from_text(const char *mode);
+static const char *ws2812_mode_to_text(ws2812_mode_t mode);
+static ws2812_transition_style_t ws2812_transition_style_from_text(const char *style);
+static const char *ws2812_transition_style_to_text(ws2812_transition_style_t style);
 static button_action_type_t button_action_type_from_text(const char *type);
 static const char *button_action_type_to_text(button_action_type_t type);
 static void notify_runtime_changed(void);
@@ -212,8 +283,19 @@ static cJSON *build_button_status_json(const button_runtime_t *btn);
 static cJSON *build_sensor_status_json(const sensor_runtime_t *sensor);
 static esp_err_t ensure_i2c_bus_locked(int sda_gpio, int scl_gpio, int freq_hz);
 static esp_err_t ensure_ds18b20_bus_locked(const sensor_runtime_t *sensor);
+static esp_err_t ensure_adc_channel_locked(int gpio, adc_channel_t *out_channel);
 static esp_err_t read_sensor_locked(sensor_runtime_t *sensor);
 static esp_err_t read_ds18b20_locked(void);
+static esp_err_t set_pwm_power_relay_locked(output_runtime_t *out, bool on);
+static bool output_supports_power_control(const output_runtime_t *out);
+static bool output_supports_level_control(const output_runtime_t *out);
+static esp_err_t servo_5wire_set_drive_locked(output_runtime_t *out, int logical_direction);
+static int servo_5wire_feedback_to_level_locked(const output_runtime_t *out, int raw);
+static esp_err_t servo_5wire_read_feedback_locked(output_runtime_t *out, int *out_raw, int *out_level);
+static bool update_servo_5wire_control_locked(output_runtime_t *out, int64_t now_us);
+static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, uint8_t red, uint8_t green, uint8_t blue, int wipe_active_segments);
+static esp_err_t apply_ws2812_target_locked(output_runtime_t *out, bool allow_transition);
+static void update_ws2812_transitions_locked(int64_t now_us);
 
 static const cJSON *jobj(const cJSON *obj, const char *key)
 {
@@ -272,6 +354,12 @@ static output_type_t output_type_from_text(const char *type)
     if (strcmp(type, "ws2812") == 0) {
         return OUTPUT_TYPE_WS2812;
     }
+    if (strcmp(type, "servo_3wire") == 0) {
+        return OUTPUT_TYPE_SERVO_3WIRE;
+    }
+    if (strcmp(type, "servo_5wire") == 0) {
+        return OUTPUT_TYPE_SERVO_5WIRE;
+    }
     return OUTPUT_TYPE_NONE;
 }
 
@@ -281,7 +369,47 @@ static const char *output_type_to_text(output_type_t type)
         case OUTPUT_TYPE_RELAY: return "relay";
         case OUTPUT_TYPE_PWM: return "pwm";
         case OUTPUT_TYPE_WS2812: return "ws2812";
+        case OUTPUT_TYPE_SERVO_3WIRE: return "servo_3wire";
+        case OUTPUT_TYPE_SERVO_5WIRE: return "servo_5wire";
         default: return "unknown";
+    }
+}
+
+static ws2812_mode_t ws2812_mode_from_text(const char *mode)
+{
+    if (strcmp(mode, "mono_triplet") == 0) {
+        return WS2812_MODE_MONO_TRIPLET;
+    }
+    return WS2812_MODE_RGB;
+}
+
+static const char *ws2812_mode_to_text(ws2812_mode_t mode)
+{
+    switch (mode) {
+        case WS2812_MODE_MONO_TRIPLET: return "mono_triplet";
+        case WS2812_MODE_RGB:
+        default: return "rgb";
+    }
+}
+
+static ws2812_transition_style_t ws2812_transition_style_from_text(const char *style)
+{
+    if (strcmp(style, "fade") == 0) {
+        return WS2812_TRANSITION_FADE;
+    }
+    if (strcmp(style, "wipe") == 0) {
+        return WS2812_TRANSITION_WIPE;
+    }
+    return WS2812_TRANSITION_NONE;
+}
+
+static const char *ws2812_transition_style_to_text(ws2812_transition_style_t style)
+{
+    switch (style) {
+        case WS2812_TRANSITION_FADE: return "fade";
+        case WS2812_TRANSITION_WIPE: return "wipe";
+        case WS2812_TRANSITION_NONE:
+        default: return "none";
     }
 }
 
@@ -332,6 +460,486 @@ static void notify_runtime_changed(void)
     }
 }
 
+static bool output_supports_power_control(const output_runtime_t *out)
+{
+    if (!out) {
+        return false;
+    }
+
+    return out->type == OUTPUT_TYPE_RELAY ||
+           out->type == OUTPUT_TYPE_PWM ||
+           out->type == OUTPUT_TYPE_WS2812;
+}
+
+static bool output_supports_level_control(const output_runtime_t *out)
+{
+    if (!out) {
+        return false;
+    }
+
+    return out->type == OUTPUT_TYPE_PWM ||
+           out->type == OUTPUT_TYPE_WS2812 ||
+           out->type == OUTPUT_TYPE_SERVO_3WIRE ||
+           out->type == OUTPUT_TYPE_SERVO_5WIRE;
+}
+
+static esp_err_t set_pwm_power_relay_locked(output_runtime_t *out, bool on)
+{
+    if (!out || out->type != OUTPUT_TYPE_PWM || out->cfg.pwm.power_relay_gpio < 0) {
+        return ESP_OK;
+    }
+
+    int level = on ? out->cfg.pwm.power_relay_active_level : (1 - out->cfg.pwm.power_relay_active_level);
+    return gpio_set_level(out->cfg.pwm.power_relay_gpio, level);
+}
+
+static esp_err_t ensure_adc_channel_locked(int gpio, adc_channel_t *out_channel)
+{
+    adc_unit_t unit = ADC_UNIT_1;
+    adc_channel_t channel = ADC_CHANNEL_0;
+    esp_err_t err;
+
+    if (adc_oneshot_io_to_channel(gpio, &unit, &channel) != ESP_OK || unit != ADC_UNIT_1) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (!s_runtime.adc.handle) {
+        adc_oneshot_unit_init_cfg_t init_cfg = {
+            .unit_id = ADC_UNIT_1,
+            .ulp_mode = ADC_ULP_MODE_DISABLE,
+        };
+        ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&init_cfg, &s_runtime.adc.handle),
+                            TAG, "adc init failed");
+        s_runtime.adc.active = true;
+        s_runtime.adc.configured_mask = 0;
+    }
+
+    if ((s_runtime.adc.configured_mask & (1U << channel)) == 0U) {
+        adc_oneshot_chan_cfg_t chan_cfg = {
+            .atten = ADC_ATTEN_DB_12,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        err = adc_oneshot_config_channel(s_runtime.adc.handle, channel, &chan_cfg);
+        if (err != ESP_OK) {
+            return err;
+        }
+        s_runtime.adc.configured_mask |= (1U << channel);
+    }
+
+    if (out_channel) {
+        *out_channel = channel;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t servo_5wire_set_drive_locked(output_runtime_t *out, int logical_direction)
+{
+    int drive = logical_direction;
+    int level_a = 0;
+    int level_b = 0;
+
+    if (!out || out->type != OUTPUT_TYPE_SERVO_5WIRE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (drive > 0) {
+        drive = 1;
+    } else if (drive < 0) {
+        drive = -1;
+    } else {
+        drive = 0;
+    }
+
+    if (out->cfg.servo_5wire.reverse_direction) {
+        drive = -drive;
+    }
+
+    if (drive > 0) {
+        level_a = 1;
+        level_b = 0;
+    } else if (drive < 0) {
+        level_a = 0;
+        level_b = 1;
+    }
+
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->gpio, level_a), TAG, "servo a drive failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.servo_5wire.gpio_b, level_b), TAG, "servo b drive failed");
+    out->cfg.servo_5wire.drive_state = logical_direction > 0 ? 1 : (logical_direction < 0 ? -1 : 0);
+    return ESP_OK;
+}
+
+static int servo_5wire_feedback_to_level_locked(const output_runtime_t *out, int raw)
+{
+    int min_raw;
+    int max_raw;
+    int pct;
+
+    if (!out || out->type != OUTPUT_TYPE_SERVO_5WIRE) {
+        return 0;
+    }
+
+    min_raw = out->cfg.servo_5wire.feedback_min_raw;
+    max_raw = out->cfg.servo_5wire.feedback_max_raw;
+    if (min_raw == max_raw) {
+        return 0;
+    }
+
+    if (min_raw < max_raw) {
+        pct = (int)(((int64_t)(raw - min_raw) * 100LL) / (int64_t)(max_raw - min_raw));
+    } else {
+        pct = (int)(((int64_t)(min_raw - raw) * 100LL) / (int64_t)(min_raw - max_raw));
+    }
+
+    if (pct < 0) {
+        pct = 0;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    return pct;
+}
+
+static esp_err_t servo_5wire_read_feedback_locked(output_runtime_t *out, int *out_raw, int *out_level)
+{
+    int sum = 0;
+    int raw = 0;
+
+    if (!out || out->type != OUTPUT_TYPE_SERVO_5WIRE || !s_runtime.adc.handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        ESP_RETURN_ON_ERROR(adc_oneshot_read(s_runtime.adc.handle, out->cfg.servo_5wire.adc_channel, &raw),
+                            TAG, "servo feedback read failed");
+        sum += raw;
+    }
+
+    raw = sum / 4;
+    out->cfg.servo_5wire.feedback_raw = raw;
+    out->cfg.servo_5wire.current_level = servo_5wire_feedback_to_level_locked(out, raw);
+
+    if (out_raw) {
+        *out_raw = raw;
+    }
+    if (out_level) {
+        *out_level = out->cfg.servo_5wire.current_level;
+    }
+    return ESP_OK;
+}
+
+static bool update_servo_5wire_control_locked(output_runtime_t *out, int64_t now_us)
+{
+    int previous_level;
+    bool previous_moving;
+    bool previous_timeout;
+    int current_level = 0;
+    int error = 0;
+    int direction = 0;
+    bool changed = false;
+
+    if (!out || out->type != OUTPUT_TYPE_SERVO_5WIRE || !out->enabled || !out->supported) {
+        return false;
+    }
+
+    previous_level = out->cfg.servo_5wire.current_level;
+    previous_moving = out->cfg.servo_5wire.moving;
+    previous_timeout = out->cfg.servo_5wire.timed_out;
+
+    if (servo_5wire_read_feedback_locked(out, NULL, &current_level) != ESP_OK) {
+        (void)servo_5wire_set_drive_locked(out, 0);
+        out->cfg.servo_5wire.moving = false;
+        return previous_moving;
+    }
+
+    error = out->cfg.servo_5wire.target_level - current_level;
+    if (error > out->cfg.servo_5wire.deadband_pct) {
+        direction = 1;
+    } else if (error < -out->cfg.servo_5wire.deadband_pct) {
+        direction = -1;
+    }
+
+    if (direction == 0) {
+        (void)servo_5wire_set_drive_locked(out, 0);
+        out->cfg.servo_5wire.moving = false;
+        out->cfg.servo_5wire.timed_out = false;
+        out->cfg.servo_5wire.drive_started_us = 0;
+    } else if (out->cfg.servo_5wire.timed_out) {
+        (void)servo_5wire_set_drive_locked(out, 0);
+        out->cfg.servo_5wire.moving = false;
+    } else {
+        if (!out->cfg.servo_5wire.moving || out->cfg.servo_5wire.drive_state != direction) {
+            out->cfg.servo_5wire.drive_started_us = now_us;
+            out->cfg.servo_5wire.timed_out = false;
+        }
+
+        if (out->cfg.servo_5wire.drive_started_us > 0 &&
+            (now_us - out->cfg.servo_5wire.drive_started_us) >= ((int64_t)out->cfg.servo_5wire.move_timeout_ms * 1000LL)) {
+            (void)servo_5wire_set_drive_locked(out, 0);
+            out->cfg.servo_5wire.moving = false;
+            out->cfg.servo_5wire.timed_out = true;
+            out->cfg.servo_5wire.drive_started_us = 0;
+        } else {
+            (void)servo_5wire_set_drive_locked(out, direction);
+            out->cfg.servo_5wire.moving = true;
+            out->cfg.servo_5wire.timed_out = false;
+        }
+    }
+
+    changed = previous_level != out->cfg.servo_5wire.current_level ||
+              previous_moving != out->cfg.servo_5wire.moving ||
+              previous_timeout != out->cfg.servo_5wire.timed_out;
+    out->power = out->cfg.servo_5wire.moving;
+    return changed;
+}
+
+static bool ws2812_color_order_valid(const char *order)
+{
+    static const char *const k_valid_orders[] = {
+        "RGB", "RBG", "GRB", "GBR", "BRG", "BGR",
+    };
+
+    if (!order || order[0] == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < sizeof(k_valid_orders) / sizeof(k_valid_orders[0]); ++i) {
+        if (strcmp(order, k_valid_orders[i]) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static uint8_t ws2812_channel_value(char channel, uint8_t red, uint8_t green, uint8_t blue)
+{
+    switch (channel) {
+        case 'R': return red;
+        case 'G': return green;
+        case 'B': return blue;
+        default: return 0;
+    }
+}
+
+static esp_err_t ws2812_set_pixel_ordered(output_runtime_t *out, int index, uint8_t red, uint8_t green, uint8_t blue)
+{
+    const char *order = ws2812_color_order_valid(out->cfg.ws2812.color_order) ? out->cfg.ws2812.color_order : "GRB";
+    uint8_t wire_0 = ws2812_channel_value(order[0], red, green, blue);
+    uint8_t wire_1 = ws2812_channel_value(order[1], red, green, blue);
+    uint8_t wire_2 = ws2812_channel_value(order[2], red, green, blue);
+
+    return led_strip_set_pixel(out->cfg.ws2812.strip, (uint32_t)index, wire_1, wire_0, wire_2);
+}
+
+static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, uint8_t red, uint8_t green, uint8_t blue, int wipe_active_segments)
+{
+    if (!out || out->type != OUTPUT_TYPE_WS2812 || !out->cfg.ws2812.strip) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (level < 0) {
+        level = 0;
+    }
+    if (level > 100) {
+        level = 100;
+    }
+
+    if (level <= 0) {
+        ESP_ERROR_CHECK(led_strip_clear(out->cfg.ws2812.strip));
+        return ESP_OK;
+    }
+
+    if (out->cfg.ws2812.mode == WS2812_MODE_MONO_TRIPLET) {
+        int total_segments = out->cfg.ws2812.pixel_count * 3;
+        int active_segments = wipe_active_segments;
+        uint8_t mono = (uint8_t)(((uint32_t)255U * (uint32_t)level) / 100U);
+        const char *order = ws2812_color_order_valid(out->cfg.ws2812.color_order) ? out->cfg.ws2812.color_order : "GRB";
+
+        if (active_segments < 0 || active_segments > total_segments) {
+            active_segments = total_segments;
+        }
+
+        for (int pixel = 0; pixel < out->cfg.ws2812.pixel_count; ++pixel) {
+            uint8_t pixel_r = 0;
+            uint8_t pixel_g = 0;
+            uint8_t pixel_b = 0;
+
+            for (int slot = 0; slot < 3; ++slot) {
+                int seg_index = (pixel * 3) + slot;
+                uint8_t channel_level = (seg_index < active_segments) ? mono : 0;
+                switch (order[slot]) {
+                    case 'R':
+                        pixel_r = channel_level;
+                        break;
+                    case 'G':
+                        pixel_g = channel_level;
+                        break;
+                    case 'B':
+                        pixel_b = channel_level;
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            ESP_ERROR_CHECK(ws2812_set_pixel_ordered(out, pixel, pixel_r, pixel_g, pixel_b));
+        }
+    } else {
+        uint8_t scaled_r = (uint8_t)(((uint32_t)red * (uint32_t)level) / 100U);
+        uint8_t scaled_g = (uint8_t)(((uint32_t)green * (uint32_t)level) / 100U);
+        uint8_t scaled_b = (uint8_t)(((uint32_t)blue * (uint32_t)level) / 100U);
+
+        for (int i = 0; i < out->cfg.ws2812.pixel_count; ++i) {
+            ESP_ERROR_CHECK(ws2812_set_pixel_ordered(out, i, scaled_r, scaled_g, scaled_b));
+        }
+    }
+
+    return led_strip_refresh(out->cfg.ws2812.strip);
+}
+
+static esp_err_t apply_ws2812_target_locked(output_runtime_t *out, bool allow_transition)
+{
+    int target_level;
+    bool wants_wipe = false;
+
+    if (!out || out->type != OUTPUT_TYPE_WS2812) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    target_level = out->power ? out->cfg.ws2812.level : 0;
+    wants_wipe = (out->cfg.ws2812.mode == WS2812_MODE_MONO_TRIPLET) &&
+                 (out->cfg.ws2812.transition_style == WS2812_TRANSITION_WIPE) &&
+                 ((out->cfg.ws2812.applied_level == 0 && target_level > 0) ||
+                  (out->cfg.ws2812.applied_level > 0 && target_level == 0));
+
+    if (out->cfg.ws2812.applied_level == target_level &&
+        out->cfg.ws2812.applied_red == out->cfg.ws2812.red &&
+        out->cfg.ws2812.applied_green == out->cfg.ws2812.green &&
+        out->cfg.ws2812.applied_blue == out->cfg.ws2812.blue) {
+        out->cfg.ws2812.transition_active = false;
+        out->cfg.ws2812.transition_use_wipe = false;
+        return render_ws2812_frame_locked(out, out->cfg.ws2812.applied_level,
+                                          out->cfg.ws2812.applied_red,
+                                          out->cfg.ws2812.applied_green,
+                                          out->cfg.ws2812.applied_blue, -1);
+    }
+
+    if (!allow_transition || out->cfg.ws2812.transition_style == WS2812_TRANSITION_NONE ||
+        out->cfg.ws2812.transition_ms <= 0) {
+        out->cfg.ws2812.transition_active = false;
+        out->cfg.ws2812.transition_use_wipe = false;
+        out->cfg.ws2812.applied_level = target_level;
+        out->cfg.ws2812.applied_red = out->cfg.ws2812.red;
+        out->cfg.ws2812.applied_green = out->cfg.ws2812.green;
+        out->cfg.ws2812.applied_blue = out->cfg.ws2812.blue;
+        return render_ws2812_frame_locked(out, out->cfg.ws2812.applied_level,
+                                          out->cfg.ws2812.applied_red,
+                                          out->cfg.ws2812.applied_green,
+                                          out->cfg.ws2812.applied_blue, -1);
+    }
+
+    out->cfg.ws2812.transition_active = true;
+    out->cfg.ws2812.transition_use_wipe = wants_wipe;
+    out->cfg.ws2812.transition_started_us = esp_timer_get_time();
+    out->cfg.ws2812.transition_duration_us = (int64_t)out->cfg.ws2812.transition_ms * 1000LL;
+    out->cfg.ws2812.start_level = out->cfg.ws2812.applied_level;
+    out->cfg.ws2812.target_level = target_level;
+    out->cfg.ws2812.start_red = out->cfg.ws2812.applied_red;
+    out->cfg.ws2812.start_green = out->cfg.ws2812.applied_green;
+    out->cfg.ws2812.start_blue = out->cfg.ws2812.applied_blue;
+    out->cfg.ws2812.target_red = out->cfg.ws2812.red;
+    out->cfg.ws2812.target_green = out->cfg.ws2812.green;
+    out->cfg.ws2812.target_blue = out->cfg.ws2812.blue;
+    return ESP_OK;
+}
+
+static void update_ws2812_transitions_locked(int64_t now_us)
+{
+    for (int i = 0; i < s_runtime.output_count; ++i) {
+        output_runtime_t *out = &s_runtime.outputs[i];
+        int64_t elapsed_us;
+        int level;
+        uint8_t red;
+        uint8_t green;
+        uint8_t blue;
+
+        if (!out->used || !out->enabled || out->type != OUTPUT_TYPE_WS2812 || !out->cfg.ws2812.transition_active) {
+            continue;
+        }
+
+        elapsed_us = now_us - out->cfg.ws2812.transition_started_us;
+        if (elapsed_us < 0) {
+            elapsed_us = 0;
+        }
+
+        if (elapsed_us >= out->cfg.ws2812.transition_duration_us) {
+            out->cfg.ws2812.transition_active = false;
+            out->cfg.ws2812.transition_use_wipe = false;
+            out->cfg.ws2812.applied_level = out->cfg.ws2812.target_level;
+            out->cfg.ws2812.applied_red = out->cfg.ws2812.target_red;
+            out->cfg.ws2812.applied_green = out->cfg.ws2812.target_green;
+            out->cfg.ws2812.applied_blue = out->cfg.ws2812.target_blue;
+            (void)render_ws2812_frame_locked(out, out->cfg.ws2812.applied_level,
+                                             out->cfg.ws2812.applied_red,
+                                             out->cfg.ws2812.applied_green,
+                                             out->cfg.ws2812.applied_blue, -1);
+            continue;
+        }
+
+        if (out->cfg.ws2812.transition_use_wipe) {
+            int total_segments = out->cfg.ws2812.pixel_count * 3;
+            int active_segments;
+            bool turning_on = (out->cfg.ws2812.start_level == 0 && out->cfg.ws2812.target_level > 0);
+
+            if (turning_on) {
+                active_segments = (int)((elapsed_us * total_segments + out->cfg.ws2812.transition_duration_us - 1) /
+                                        out->cfg.ws2812.transition_duration_us);
+            } else {
+                active_segments = total_segments -
+                                  (int)((elapsed_us * total_segments + out->cfg.ws2812.transition_duration_us - 1) /
+                                        out->cfg.ws2812.transition_duration_us);
+            }
+
+            if (active_segments < 0) {
+                active_segments = 0;
+            }
+            if (active_segments > total_segments) {
+                active_segments = total_segments;
+            }
+
+            out->cfg.ws2812.applied_level = turning_on ? out->cfg.ws2812.target_level : out->cfg.ws2812.start_level;
+            out->cfg.ws2812.applied_red = out->cfg.ws2812.target_red;
+            out->cfg.ws2812.applied_green = out->cfg.ws2812.target_green;
+            out->cfg.ws2812.applied_blue = out->cfg.ws2812.target_blue;
+            (void)render_ws2812_frame_locked(out, out->cfg.ws2812.applied_level,
+                                             out->cfg.ws2812.applied_red,
+                                             out->cfg.ws2812.applied_green,
+                                             out->cfg.ws2812.applied_blue,
+                                             active_segments);
+            continue;
+        }
+
+        level = out->cfg.ws2812.start_level +
+                (int)(((int64_t)(out->cfg.ws2812.target_level - out->cfg.ws2812.start_level) * elapsed_us) /
+                      out->cfg.ws2812.transition_duration_us);
+        red = (uint8_t)(out->cfg.ws2812.start_red +
+                        (int)(((int64_t)(out->cfg.ws2812.target_red - out->cfg.ws2812.start_red) * elapsed_us) /
+                              out->cfg.ws2812.transition_duration_us));
+        green = (uint8_t)(out->cfg.ws2812.start_green +
+                          (int)(((int64_t)(out->cfg.ws2812.target_green - out->cfg.ws2812.start_green) * elapsed_us) /
+                                out->cfg.ws2812.transition_duration_us));
+        blue = (uint8_t)(out->cfg.ws2812.start_blue +
+                         (int)(((int64_t)(out->cfg.ws2812.target_blue - out->cfg.ws2812.start_blue) * elapsed_us) /
+                               out->cfg.ws2812.transition_duration_us));
+
+        out->cfg.ws2812.applied_level = level;
+        out->cfg.ws2812.applied_red = red;
+        out->cfg.ws2812.applied_green = green;
+        out->cfg.ws2812.applied_blue = blue;
+        (void)render_ws2812_frame_locked(out, level, red, green, blue, -1);
+    }
+}
+
 static output_runtime_t *find_output_locked(const char *id)
 {
     if (!id || !id[0]) {
@@ -373,35 +981,74 @@ static esp_err_t output_apply_physical_state(output_runtime_t *out)
             int level = out->cfg.pwm.level;
             uint32_t duty = 0;
             const uint32_t max_duty = (1U << LEDC_TIMER_13_BIT) - 1U;
-            int effective = out->power ? level : 0;
-            if (effective < 0) {
-                effective = 0;
+            int requested = out->power ? level : 0;
+            int limited = 0;
+            bool supply_on = false;
+
+            if (requested < 0) {
+                requested = 0;
             }
-            if (effective > 100) {
-                effective = 100;
+            if (requested > 100) {
+                requested = 100;
             }
+
+            limited = (requested * out->cfg.pwm.max_level_pct) / 100;
+            if (limited < 0) {
+                limited = 0;
+            }
+            if (limited > 100) {
+                limited = 100;
+            }
+
+            supply_on = out->power && requested > 0;
+            if (supply_on) {
+                esp_err_t err = set_pwm_power_relay_locked(out, true);
+                if (err != ESP_OK) {
+                    return err;
+                }
+            }
+
             if (out->cfg.pwm.inverted) {
-                effective = 100 - effective;
+                limited = 100 - limited;
             }
-            duty = (uint32_t)((effective * (int)max_duty) / 100);
+            duty = (uint32_t)((limited * (int)max_duty) / 100);
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, out->cfg.pwm.channel, duty));
-            return ledc_update_duty(LEDC_LOW_SPEED_MODE, out->cfg.pwm.channel);
+            esp_err_t err = ledc_update_duty(LEDC_LOW_SPEED_MODE, out->cfg.pwm.channel);
+            if (err != ESP_OK) {
+                return err;
+            }
+
+            if (!supply_on) {
+                err = set_pwm_power_relay_locked(out, false);
+                if (err != ESP_OK) {
+                    return err;
+                }
+            }
+            return ESP_OK;
         }
         case OUTPUT_TYPE_WS2812:
-            if (!out->cfg.ws2812.strip) {
-                return ESP_ERR_INVALID_STATE;
+            return apply_ws2812_target_locked(out, true);
+        case OUTPUT_TYPE_SERVO_3WIRE: {
+            int level = out->cfg.servo_3wire.level;
+            int pulse_us;
+            uint32_t duty;
+            const uint32_t max_duty = (1U << LEDC_TIMER_13_BIT) - 1U;
+
+            if (level < 0) {
+                level = 0;
             }
-            if (!out->power || out->cfg.ws2812.level <= 0) {
-                ESP_ERROR_CHECK(led_strip_clear(out->cfg.ws2812.strip));
-                return ESP_OK;
+            if (level > 100) {
+                level = 100;
             }
-            for (int i = 0; i < out->cfg.ws2812.pixel_count; ++i) {
-                uint32_t red = ((uint32_t)out->cfg.ws2812.red * (uint32_t)out->cfg.ws2812.level) / 100U;
-                uint32_t green = ((uint32_t)out->cfg.ws2812.green * (uint32_t)out->cfg.ws2812.level) / 100U;
-                uint32_t blue = ((uint32_t)out->cfg.ws2812.blue * (uint32_t)out->cfg.ws2812.level) / 100U;
-                ESP_ERROR_CHECK(led_strip_set_pixel(out->cfg.ws2812.strip, (uint32_t)i, red, green, blue));
-            }
-            return led_strip_refresh(out->cfg.ws2812.strip);
+
+            pulse_us = out->cfg.servo_3wire.min_us +
+                       (int)(((int64_t)(out->cfg.servo_3wire.max_us - out->cfg.servo_3wire.min_us) * level) / 100LL);
+            duty = (uint32_t)(((int64_t)pulse_us * (int64_t)max_duty) / 20000LL);
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel, duty));
+            return ledc_update_duty(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel);
+        }
+        case OUTPUT_TYPE_SERVO_5WIRE:
+            return servo_5wire_set_drive_locked(out, 0);
         default:
             return ESP_ERR_INVALID_ARG;
     }
@@ -411,6 +1058,9 @@ static esp_err_t set_output_power_locked(output_runtime_t *out, bool on)
 {
     if (!out || !out->enabled) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!output_supports_power_control(out)) {
+        return ESP_ERR_INVALID_ARG;
     }
     out->power = on;
     return output_apply_physical_state(out);
@@ -434,8 +1084,20 @@ static esp_err_t set_output_level_locked(output_runtime_t *out, int level)
     } else if (out->type == OUTPUT_TYPE_WS2812) {
         out->cfg.ws2812.level = level;
         out->power = (level > 0);
+    } else if (out->type == OUTPUT_TYPE_SERVO_3WIRE) {
+        out->cfg.servo_3wire.level = level;
+        out->power = true;
+    } else if (out->type == OUTPUT_TYPE_SERVO_5WIRE) {
+        out->cfg.servo_5wire.target_level = level;
+        out->cfg.servo_5wire.timed_out = false;
+        out->power = out->cfg.servo_5wire.moving;
     } else {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    if (out->type == OUTPUT_TYPE_SERVO_5WIRE) {
+        (void)update_servo_5wire_control_locked(out, esp_timer_get_time());
+        return ESP_OK;
     }
 
     return output_apply_physical_state(out);
@@ -455,6 +1117,16 @@ static void clear_runtime_locked(void)
         }
         if (out->type == OUTPUT_TYPE_PWM) {
             (void)ledc_stop(LEDC_LOW_SPEED_MODE, out->cfg.pwm.channel, 0);
+            if (out->cfg.pwm.power_relay_gpio >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.pwm.power_relay_gpio);
+            }
+        }
+        if (out->type == OUTPUT_TYPE_SERVO_3WIRE) {
+            (void)ledc_stop(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel, 0);
+        }
+        if (out->type == OUTPUT_TYPE_SERVO_5WIRE && out->cfg.servo_5wire.gpio_b >= 0) {
+            (void)servo_5wire_set_drive_locked(out, 0);
+            gpio_reset_pin((gpio_num_t)out->cfg.servo_5wire.gpio_b);
         }
         if (out->gpio >= 0) {
             gpio_reset_pin((gpio_num_t)out->gpio);
@@ -499,6 +1171,10 @@ static void clear_runtime_locked(void)
     if (s_runtime.i2c.bus) {
         (void)i2c_bus_delete(&s_runtime.i2c.bus);
     }
+    if (s_runtime.adc.handle) {
+        (void)adc_oneshot_del_unit(s_runtime.adc.handle);
+        s_runtime.adc.handle = NULL;
+    }
 
     memset(&s_runtime, 0, sizeof(s_runtime));
 }
@@ -538,6 +1214,15 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         out->cfg.pwm.freq_hz = jint(item, "freq_hz", 1000);
         out->cfg.pwm.inverted = jbool(item, "inverted", false);
         out->cfg.pwm.level = jint(item, "default_level", 0);
+        out->cfg.pwm.max_level_pct = jint(item, "max_level_pct", 100);
+        if (out->cfg.pwm.max_level_pct < 1) {
+            out->cfg.pwm.max_level_pct = 1;
+        }
+        if (out->cfg.pwm.max_level_pct > 100) {
+            out->cfg.pwm.max_level_pct = 100;
+        }
+        out->cfg.pwm.power_relay_gpio = jint(item, "power_relay_gpio", -1);
+        out->cfg.pwm.power_relay_active_level = jint(item, "power_relay_active_level", 1) ? 1 : 0;
         out->cfg.pwm.channel = (ledc_channel_t)index;
         out->cfg.pwm.timer = (ledc_timer_t)(index % 4);
         out->power = out->cfg.pwm.level > 0;
@@ -561,18 +1246,142 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .hpoint = 0,
         };
         ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
+
+        if (out->cfg.pwm.power_relay_gpio >= 0) {
+            gpio_config_t relay_io = {
+                .pin_bit_mask = 1ULL << out->cfg.pwm.power_relay_gpio,
+                .mode = GPIO_MODE_OUTPUT,
+                .pull_up_en = GPIO_PULLUP_DISABLE,
+                .pull_down_en = GPIO_PULLDOWN_DISABLE,
+                .intr_type = GPIO_INTR_DISABLE,
+            };
+            ESP_ERROR_CHECK(gpio_config(&relay_io));
+            ESP_ERROR_CHECK(set_pwm_power_relay_locked(out, false));
+        }
         return output_apply_physical_state(out);
+    }
+
+    if (out->type == OUTPUT_TYPE_SERVO_3WIRE) {
+        out->cfg.servo_3wire.level = jint(item, "default_level", 0);
+        out->cfg.servo_3wire.min_us = jint(item, "min_us", 500);
+        out->cfg.servo_3wire.max_us = jint(item, "max_us", 2500);
+        if (out->cfg.servo_3wire.level < 0) {
+            out->cfg.servo_3wire.level = 0;
+        }
+        if (out->cfg.servo_3wire.level > 100) {
+            out->cfg.servo_3wire.level = 100;
+        }
+        if (out->cfg.servo_3wire.min_us < 400) {
+            out->cfg.servo_3wire.min_us = 400;
+        }
+        if (out->cfg.servo_3wire.max_us > 2600) {
+            out->cfg.servo_3wire.max_us = 2600;
+        }
+        if (out->cfg.servo_3wire.max_us <= out->cfg.servo_3wire.min_us) {
+            out->cfg.servo_3wire.max_us = out->cfg.servo_3wire.min_us + 100;
+        }
+
+        out->cfg.servo_3wire.channel = (ledc_channel_t)index;
+        out->cfg.servo_3wire.timer = (ledc_timer_t)(index % 4);
+        out->power = true;
+
+        ledc_timer_config_t timer_cfg = {
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .timer_num = out->cfg.servo_3wire.timer,
+            .duty_resolution = LEDC_TIMER_13_BIT,
+            .freq_hz = 50,
+            .clk_cfg = LEDC_AUTO_CLK,
+        };
+        ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+        ledc_channel_config_t chan_cfg = {
+            .gpio_num = out->gpio,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = out->cfg.servo_3wire.channel,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = out->cfg.servo_3wire.timer,
+            .duty = 0,
+            .hpoint = 0,
+        };
+        ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
+        return output_apply_physical_state(out);
+    }
+
+    if (out->type == OUTPUT_TYPE_SERVO_5WIRE) {
+        out->cfg.servo_5wire.gpio_b = jint(item, "gpio_b", -1);
+        out->cfg.servo_5wire.feedback_gpio = jint(item, "feedback_gpio", -1);
+        out->cfg.servo_5wire.feedback_min_raw = jint(item, "feedback_min_raw", 300);
+        out->cfg.servo_5wire.feedback_max_raw = jint(item, "feedback_max_raw", 3700);
+        out->cfg.servo_5wire.deadband_pct = jint(item, "deadband_pct", 2);
+        out->cfg.servo_5wire.move_timeout_ms = jint(item, "move_timeout_ms", 15000);
+        out->cfg.servo_5wire.reverse_direction = jbool(item, "reverse_direction", false);
+        out->cfg.servo_5wire.target_level = jint(item, "default_level", 0);
+        out->cfg.servo_5wire.feedback_raw = 0;
+        out->cfg.servo_5wire.current_level = 0;
+        out->cfg.servo_5wire.drive_state = 0;
+        out->cfg.servo_5wire.moving = false;
+        out->cfg.servo_5wire.timed_out = false;
+        if (out->cfg.servo_5wire.target_level < 0) {
+            out->cfg.servo_5wire.target_level = 0;
+        }
+        if (out->cfg.servo_5wire.target_level > 100) {
+            out->cfg.servo_5wire.target_level = 100;
+        }
+        if (out->cfg.servo_5wire.deadband_pct < 1) {
+            out->cfg.servo_5wire.deadband_pct = 1;
+        }
+        if (out->cfg.servo_5wire.deadband_pct > 20) {
+            out->cfg.servo_5wire.deadband_pct = 20;
+        }
+        if (out->cfg.servo_5wire.move_timeout_ms < 1000) {
+            out->cfg.servo_5wire.move_timeout_ms = 1000;
+        }
+        if (out->cfg.servo_5wire.move_timeout_ms > 60000) {
+            out->cfg.servo_5wire.move_timeout_ms = 60000;
+        }
+
+        gpio_config_t io_b = {
+            .pin_bit_mask = 1ULL << out->cfg.servo_5wire.gpio_b,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&io_b));
+        ESP_ERROR_CHECK(ensure_adc_channel_locked(out->cfg.servo_5wire.feedback_gpio,
+                                                 &out->cfg.servo_5wire.adc_channel));
+        out->supported = true;
+        out->power = false;
+        ESP_ERROR_CHECK(servo_5wire_set_drive_locked(out, 0));
+        (void)update_servo_5wire_control_locked(out, esp_timer_get_time());
+        return ESP_OK;
     }
 
     if (out->type == OUTPUT_TYPE_WS2812) {
         out->cfg.ws2812.pixel_count = jint(item, "pixel_count", 1);
         snprintf(out->cfg.ws2812.color_order, sizeof(out->cfg.ws2812.color_order), "%s",
                  jstr(item, "color_order", "GRB"));
+        if (!ws2812_color_order_valid(out->cfg.ws2812.color_order)) {
+            snprintf(out->cfg.ws2812.color_order, sizeof(out->cfg.ws2812.color_order), "%s", "GRB");
+        }
         out->cfg.ws2812.default_power_on = jbool(item, "default_power_on", false);
+        out->cfg.ws2812.mode = ws2812_mode_from_text(jstr(item, "mode", "rgb"));
+        out->cfg.ws2812.transition_style = ws2812_transition_style_from_text(jstr(item, "transition_style", "none"));
+        out->cfg.ws2812.transition_ms = jint(item, "transition_ms", 300);
+        if (out->cfg.ws2812.transition_ms < 0) {
+            out->cfg.ws2812.transition_ms = 0;
+        }
+        if (out->cfg.ws2812.transition_ms > 5000) {
+            out->cfg.ws2812.transition_ms = 5000;
+        }
         out->cfg.ws2812.level = out->cfg.ws2812.default_power_on ? 100 : 0;
         out->cfg.ws2812.red = 255;
         out->cfg.ws2812.green = 255;
         out->cfg.ws2812.blue = 255;
+        out->cfg.ws2812.applied_level = out->cfg.ws2812.level;
+        out->cfg.ws2812.applied_red = out->cfg.ws2812.red;
+        out->cfg.ws2812.applied_green = out->cfg.ws2812.green;
+        out->cfg.ws2812.applied_blue = out->cfg.ws2812.blue;
         out->power = out->cfg.ws2812.default_power_on;
         led_strip_config_t strip_cfg = {
             .strip_gpio_num = out->gpio,
@@ -583,11 +1392,6 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
                 .invert_out = false,
             },
         };
-        if (strcmp(out->cfg.ws2812.color_order, "GRB") != 0) {
-            ESP_LOGW(TAG, "WS2812 %s requested unsupported color order '%s', using GRB",
-                     out->id, out->cfg.ws2812.color_order);
-            snprintf(out->cfg.ws2812.color_order, sizeof(out->cfg.ws2812.color_order), "%s", "GRB");
-        }
         led_strip_rmt_config_t rmt_cfg = {
             .clk_src = RMT_CLK_SRC_DEFAULT,
             .resolution_hz = 10 * 1000 * 1000,
@@ -598,7 +1402,10 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         };
         ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &out->cfg.ws2812.strip));
         out->supported = true;
-        return output_apply_physical_state(out);
+        return render_ws2812_frame_locked(out, out->cfg.ws2812.applied_level,
+                                          out->cfg.ws2812.applied_red,
+                                          out->cfg.ws2812.applied_green,
+                                          out->cfg.ws2812.applied_blue, -1);
     }
 
     return ESP_ERR_INVALID_ARG;
@@ -862,10 +1669,19 @@ static esp_err_t execute_button_action_locked(const button_action_t *action)
             if (!out) {
                 return ESP_ERR_NOT_FOUND;
             }
-            if (out->type != OUTPUT_TYPE_PWM && out->type != OUTPUT_TYPE_WS2812) {
+            if (!output_supports_level_control(out)) {
                 return ESP_ERR_INVALID_ARG;
             }
-            int level = (out->type == OUTPUT_TYPE_PWM) ? out->cfg.pwm.level : out->cfg.ws2812.level;
+            int level = 0;
+            if (out->type == OUTPUT_TYPE_PWM) {
+                level = out->cfg.pwm.level;
+            } else if (out->type == OUTPUT_TYPE_WS2812) {
+                level = out->cfg.ws2812.level;
+            } else if (out->type == OUTPUT_TYPE_SERVO_3WIRE) {
+                level = out->cfg.servo_3wire.level;
+            } else if (out->type == OUTPUT_TYPE_SERVO_5WIRE) {
+                level = out->cfg.servo_5wire.target_level;
+            }
             level += (action->type == ACTION_DIM_STEP_UP) ? action->step : -action->step;
             return set_output_level_locked(out, level);
         }
@@ -942,8 +1758,19 @@ static void modules_poll_task(void *arg)
 
     while (1) {
         bool changed = false;
+        int64_t now_us = esp_timer_get_time();
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
+        update_ws2812_transitions_locked(now_us);
+        for (int i = 0; i < s_runtime.output_count; ++i) {
+            output_runtime_t *out = &s_runtime.outputs[i];
+            if (!out->used || !out->enabled || out->type != OUTPUT_TYPE_SERVO_5WIRE) {
+                continue;
+            }
+            if (update_servo_5wire_control_locked(out, now_us)) {
+                changed = true;
+            }
+        }
         for (int i = 0; i < s_runtime.input_count; ++i) {
             input_runtime_t *in = &s_runtime.inputs[i];
             if (!in->used || !in->enabled) {
@@ -965,7 +1792,6 @@ static void modules_poll_task(void *arg)
                 continue;
             }
             bool pressed = button_is_pressed(btn);
-            int64_t now_us = esp_timer_get_time();
 
             if (pressed && !btn->last_pressed) {
                 btn->pressed_since_us = now_us;
@@ -1053,7 +1879,7 @@ static esp_err_t set_master_output_locked(bool on)
     bool any = false;
     for (int i = 0; i < s_runtime.output_count; ++i) {
         output_runtime_t *out = &s_runtime.outputs[i];
-        if (!out->used || !out->enabled) {
+        if (!out->used || !out->enabled || !output_supports_power_control(out)) {
             continue;
         }
         if (set_output_power_locked(out, on) == ESP_OK) {
@@ -1067,7 +1893,7 @@ static bool is_any_output_on_locked(void)
 {
     for (int i = 0; i < s_runtime.output_count; ++i) {
         const output_runtime_t *out = &s_runtime.outputs[i];
-        if (out->used && out->enabled && out->power) {
+        if (out->used && out->enabled && output_supports_power_control(out) && out->power) {
             return true;
         }
     }
@@ -1090,15 +1916,43 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
     } else if (out->type == OUTPUT_TYPE_PWM) {
         cJSON_AddNumberToObject(obj, "level", out->cfg.pwm.level);
         cJSON_AddNumberToObject(obj, "freq_hz", out->cfg.pwm.freq_hz);
+        cJSON_AddNumberToObject(obj, "max_level_pct", out->cfg.pwm.max_level_pct);
         cJSON_AddBoolToObject(obj, "inverted", out->cfg.pwm.inverted);
+        if (out->cfg.pwm.power_relay_gpio >= 0) {
+            cJSON_AddNumberToObject(obj, "power_relay_gpio", out->cfg.pwm.power_relay_gpio);
+            cJSON_AddNumberToObject(obj, "power_relay_active_level", out->cfg.pwm.power_relay_active_level);
+            cJSON_AddBoolToObject(obj, "power_relay_on", out->power && out->cfg.pwm.level > 0);
+        }
     } else if (out->type == OUTPUT_TYPE_WS2812) {
         cJSON_AddNumberToObject(obj, "level", out->cfg.ws2812.level);
         cJSON_AddNumberToObject(obj, "pixel_count", out->cfg.ws2812.pixel_count);
+        cJSON_AddStringToObject(obj, "mode", ws2812_mode_to_text(out->cfg.ws2812.mode));
         cJSON_AddStringToObject(obj, "color_order", out->cfg.ws2812.color_order);
-        cJSON *color = cJSON_AddObjectToObject(obj, "color");
-        cJSON_AddNumberToObject(color, "r", out->cfg.ws2812.red);
-        cJSON_AddNumberToObject(color, "g", out->cfg.ws2812.green);
-        cJSON_AddNumberToObject(color, "b", out->cfg.ws2812.blue);
+        cJSON_AddStringToObject(obj, "transition_style", ws2812_transition_style_to_text(out->cfg.ws2812.transition_style));
+        cJSON_AddNumberToObject(obj, "transition_ms", out->cfg.ws2812.transition_ms);
+        if (out->cfg.ws2812.mode == WS2812_MODE_RGB) {
+            cJSON *color = cJSON_AddObjectToObject(obj, "color");
+            cJSON_AddNumberToObject(color, "r", out->cfg.ws2812.red);
+            cJSON_AddNumberToObject(color, "g", out->cfg.ws2812.green);
+            cJSON_AddNumberToObject(color, "b", out->cfg.ws2812.blue);
+        }
+    } else if (out->type == OUTPUT_TYPE_SERVO_3WIRE) {
+        cJSON_AddNumberToObject(obj, "level", out->cfg.servo_3wire.level);
+        cJSON_AddNumberToObject(obj, "min_us", out->cfg.servo_3wire.min_us);
+        cJSON_AddNumberToObject(obj, "max_us", out->cfg.servo_3wire.max_us);
+    } else if (out->type == OUTPUT_TYPE_SERVO_5WIRE) {
+        cJSON_AddNumberToObject(obj, "level", out->cfg.servo_5wire.current_level);
+        cJSON_AddNumberToObject(obj, "target_level", out->cfg.servo_5wire.target_level);
+        cJSON_AddNumberToObject(obj, "gpio_b", out->cfg.servo_5wire.gpio_b);
+        cJSON_AddNumberToObject(obj, "feedback_gpio", out->cfg.servo_5wire.feedback_gpio);
+        cJSON_AddNumberToObject(obj, "feedback_raw", out->cfg.servo_5wire.feedback_raw);
+        cJSON_AddNumberToObject(obj, "feedback_min_raw", out->cfg.servo_5wire.feedback_min_raw);
+        cJSON_AddNumberToObject(obj, "feedback_max_raw", out->cfg.servo_5wire.feedback_max_raw);
+        cJSON_AddNumberToObject(obj, "deadband_pct", out->cfg.servo_5wire.deadband_pct);
+        cJSON_AddNumberToObject(obj, "move_timeout_ms", out->cfg.servo_5wire.move_timeout_ms);
+        cJSON_AddBoolToObject(obj, "reverse_direction", out->cfg.servo_5wire.reverse_direction);
+        cJSON_AddBoolToObject(obj, "moving", out->cfg.servo_5wire.moving);
+        cJSON_AddBoolToObject(obj, "timed_out", out->cfg.servo_5wire.timed_out);
     }
     return obj;
 }
@@ -1335,9 +2189,11 @@ esp_err_t modules_action(const char *id, const cJSON *action, cJSON **out_respon
                 } else if (cJSON_IsNumber(set_level)) {
                     err = set_output_level_locked(out, set_level->valueint);
                 } else if (out->type == OUTPUT_TYPE_WS2812 && cJSON_IsObject((cJSON *)color)) {
-                    out->cfg.ws2812.red = (uint8_t)jint(color, "r", out->cfg.ws2812.red);
-                    out->cfg.ws2812.green = (uint8_t)jint(color, "g", out->cfg.ws2812.green);
-                    out->cfg.ws2812.blue = (uint8_t)jint(color, "b", out->cfg.ws2812.blue);
+                    if (out->cfg.ws2812.mode == WS2812_MODE_RGB) {
+                        out->cfg.ws2812.red = (uint8_t)jint(color, "r", out->cfg.ws2812.red);
+                        out->cfg.ws2812.green = (uint8_t)jint(color, "g", out->cfg.ws2812.green);
+                        out->cfg.ws2812.blue = (uint8_t)jint(color, "b", out->cfg.ws2812.blue);
+                    }
                     err = output_apply_physical_state(out);
                 } else {
                     err = ESP_ERR_INVALID_ARG;

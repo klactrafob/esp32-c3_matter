@@ -42,7 +42,8 @@ static esp_err_t ensure_netif_event_loop(void);
 static void ensure_default_wifi_netif_ap(void);
 static void ensure_default_wifi_netif_sta(void);
 static esp_err_t init_common_wifi(void);
-static esp_err_t start_ap_only(const char *ssid, const char *pass);
+static esp_err_t start_ap_only(const char *ssid, const char *pass, const char *device_name);
+static esp_err_t start_sta_only(const char *sta_ssid, const char *sta_pass, const char *device_name);
 
 bool wifi_mgr_is_ap(void) { return s_is_ap; }
 const char *wifi_mgr_get_ap_ssid(void) { return s_ap_ssid; }
@@ -102,6 +103,70 @@ static bool jhas_sta(const cJSON *cfg)
     const cJSON *sta = jobj(net, "sta");
     const char *ssid = jstr(sta, "ssid", "");
     return ssid && ssid[0] != 0;
+}
+
+static void build_hostname_from_device_name(const char *device_name, char *out, size_t out_len)
+{
+    size_t wr = 0;
+    bool last_was_dash = false;
+
+    if (!out || out_len == 0) {
+        return;
+    }
+
+    if (device_name) {
+        for (size_t i = 0; device_name[i] != 0 && wr + 1 < out_len; ++i) {
+            unsigned char ch = (unsigned char)device_name[i];
+            if (ch >= 'A' && ch <= 'Z') {
+                out[wr++] = (char)(ch - 'A' + 'a');
+                last_was_dash = false;
+            } else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+                out[wr++] = (char)ch;
+                last_was_dash = false;
+            } else if ((ch == ' ' || ch == '-' || ch == '_') && wr > 0 && !last_was_dash) {
+                out[wr++] = '-';
+                last_was_dash = true;
+            }
+        }
+    }
+
+    while (wr > 0 && out[wr - 1] == '-') {
+        --wr;
+    }
+    out[wr] = 0;
+
+    if (wr == 0) {
+        snprintf(out, out_len, "%s", APP_HOSTNAME_DEFAULT);
+        return;
+    }
+
+    if (out[0] >= '0' && out[0] <= '9') {
+        char prefixed[33] = {0};
+        if (snprintf(prefixed, sizeof(prefixed), "esp-%s", out) >= (int)sizeof(prefixed)) {
+            snprintf(out, out_len, "%s", APP_HOSTNAME_DEFAULT);
+            return;
+        }
+        snprintf(out, out_len, "%s", prefixed);
+    }
+}
+
+static void apply_device_hostname(esp_netif_t *netif, const char *device_name, const char *if_name)
+{
+    if (!netif) {
+        return;
+    }
+
+    char hostname[33] = {0};
+    build_hostname_from_device_name(device_name, hostname, sizeof(hostname));
+
+    esp_err_t err = esp_netif_set_hostname(netif, hostname);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set %s hostname to %s: %s",
+                 if_name, hostname, esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "%s hostname: %s", if_name, hostname);
 }
 
 // Build AP SSID with unique chip ID suffix from factory MAC (eFuse).
@@ -541,7 +606,7 @@ static esp_err_t init_common_wifi(void)
     return ESP_OK;
 }
 
-static esp_err_t start_ap_only(const char *ssid, const char *pass)
+static esp_err_t start_ap_only(const char *ssid, const char *pass, const char *device_name)
 {
     esp_err_t err = ESP_OK;
 
@@ -560,6 +625,7 @@ static esp_err_t start_ap_only(const char *ssid, const char *pass)
     if (err != ESP_OK) return err;
     preload_scan_cache_before_ap_start();
     ensure_default_wifi_netif_ap();
+    apply_device_hostname(s_ap_netif, device_name, "AP");
     err = init_common_wifi();
     if (err != ESP_OK) return err;
 
@@ -581,7 +647,7 @@ static esp_err_t start_ap_only(const char *ssid, const char *pass)
     return ESP_OK;
 }
 
-static esp_err_t start_sta_only(const char *sta_ssid, const char *sta_pass)
+static esp_err_t start_sta_only(const char *sta_ssid, const char *sta_pass, const char *device_name)
 {
     esp_err_t err = ESP_OK;
 
@@ -598,6 +664,7 @@ static esp_err_t start_sta_only(const char *sta_ssid, const char *sta_pass)
     err = ensure_netif_event_loop();
     if (err != ESP_OK) return err;
     ensure_default_wifi_netif_sta();
+    apply_device_hostname(s_sta_netif, device_name, "STA");
     err = init_common_wifi();
     if (err != ESP_OK) return err;
 
@@ -628,17 +695,19 @@ esp_err_t wifi_mgr_start_from_cfg(const cJSON *cfg)
     if (!cJSON_IsObject((cJSON *)net)) {
         net = jobj(cfg, "net");
     }
+    const cJSON *device = jobj(cfg, "device");
     const cJSON *sta = jobj(net, "sta");
     const char *st_ssid = jstr(sta, "ssid", "");
     const char *st_pass = jstr(sta, "pass", "");
+    const char *device_name = jstr(device, "name", APP_AP_SSID_DEFAULT);
 
     if (jhas_sta(cfg)) {
-        return start_sta_only(st_ssid, st_pass);
+        return start_sta_only(st_ssid, st_pass, device_name);
     }
     const cJSON *ap  = jobj(net, "ap");
-    const char *ap_ssid = jstr(ap, "ssid", APP_AP_SSID_DEFAULT);
+    const char *ap_ssid = jstr(ap, "ssid", device_name && device_name[0] ? device_name : APP_AP_SSID_DEFAULT);
     const char *ap_pass = jstr(ap, "pass", APP_AP_PASS_DEFAULT);
-    return start_ap_only(ap_ssid, ap_pass);
+    return start_ap_only(ap_ssid, ap_pass, device_name);
 }
 
 esp_err_t wifi_mgr_restart_from_cfg(const cJSON *cfg)

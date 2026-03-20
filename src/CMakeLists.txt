@@ -34,6 +34,7 @@ idf_component_register(
     lwip
     json
     mqtt
+    esp_adc
     espressif__aht20
     espressif__bme280
     espressif__ds18b20

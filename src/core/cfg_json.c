@@ -25,7 +25,6 @@ static const int s_luatos_board_gpios[] = {0, 1, 3, 4, 5, 6, 7, 10, 12, 13};
 static const char *BOARD_PROFILE = "esp32-c3-supermini";
 static const char *MQTT_DISCOVERY_PREFIX_DEFAULT = "homeassistant";
 static const char *DEVICE_NAME_DEFAULT = "ESP32 C3 MQTT Device";
-static const char *HOSTNAME_DEFAULT = "esp32-c3";
 static const char *AP_SSID_DEFAULT = "ESP32-SETUP";
 
 typedef struct {
@@ -240,6 +239,49 @@ static const board_gpio_policy_t *get_board_gpio_policy(const char *profile)
     return &s_board_gpio_policies[0];
 }
 
+static bool is_valid_ws2812_color_order(const char *value)
+{
+    static const char *const k_orders[] = {
+        "RGB", "RBG", "GRB", "GBR", "BRG", "BGR",
+    };
+
+    if (!value || value[0] == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < sizeof(k_orders) / sizeof(k_orders[0]); ++i) {
+        if (strcmp(value, k_orders[i]) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static const char *normalize_ws2812_mode(const char *value)
+{
+    if (value && strcmp(value, "mono_triplet") == 0) {
+        return "mono_triplet";
+    }
+    return "rgb";
+}
+
+static const char *normalize_ws2812_transition_style(const char *value)
+{
+    if (value && strcmp(value, "fade") == 0) {
+        return "fade";
+    }
+    if (value && strcmp(value, "wipe") == 0) {
+        return "wipe";
+    }
+    return "none";
+}
+
+static bool is_adc_feedback_gpio(int gpio)
+{
+    return gpio == 0 || gpio == 1 || gpio == 2 || gpio == 3 || gpio == 4;
+}
+
 static bool is_gpio_allowed_for_profile(const char *profile, int gpio)
 {
     const board_gpio_policy_t *policy = get_board_gpio_policy(profile);
@@ -321,7 +363,6 @@ static cJSON *create_empty_schema(void)
     cJSON_AddStringToObject(device, "node_id", node_id);
 
     cJSON *connectivity = cJSON_AddObjectToObject(root, "connectivity");
-    cJSON_AddStringToObject(connectivity, "hostname", HOSTNAME_DEFAULT);
 
     cJSON *ap = cJSON_AddObjectToObject(connectivity, "ap");
     cJSON_AddStringToObject(ap, "ssid", AP_SSID_DEFAULT);
@@ -439,8 +480,6 @@ static cJSON *normalize_config(const cJSON *src)
     cJSON_ReplaceItemInObject(device, "board_profile", cJSON_CreateString(board_profile));
     cJSON_ReplaceItemInObject(device, "node_id", cJSON_CreateString(saved_node_id));
 
-    cJSON_ReplaceItemInObject(connectivity, "hostname",
-                              cJSON_CreateString(jstr(src_conn, "hostname", HOSTNAME_DEFAULT)));
     cJSON_ReplaceItemInObject(ap, "ssid", cJSON_CreateString(jstr(src_ap, "ssid", AP_SSID_DEFAULT)));
     cJSON_ReplaceItemInObject(ap, "pass", cJSON_CreateString(jstr(src_ap, "pass", "")));
     cJSON_ReplaceItemInObject(sta, "ssid", cJSON_CreateString(jstr(src_sta, "ssid", "")));
@@ -494,7 +533,11 @@ static cJSON *normalize_config(const cJSON *src)
             }
 
             const char *type = jstr(item, "type", "relay");
-            if (strcmp(type, "relay") != 0 && strcmp(type, "pwm") != 0 && strcmp(type, "ws2812") != 0) {
+            if (strcmp(type, "relay") != 0 &&
+                strcmp(type, "pwm") != 0 &&
+                strcmp(type, "ws2812") != 0 &&
+                strcmp(type, "servo_3wire") != 0 &&
+                strcmp(type, "servo_5wire") != 0) {
                 set_error("Output %s uses unsupported type '%s'", id, type);
                 return normalize_cleanup_and_fail(root, ctx);
             }
@@ -519,6 +562,9 @@ static cJSON *normalize_config(const cJSON *src)
             } else if (strcmp(type, "pwm") == 0) {
                 int freq = jint(item, "freq_hz", 1000);
                 int default_level = jint(item, "default_level", 0);
+                int max_level_pct = jint(item, "max_level_pct", 100);
+                int power_relay_gpio = jint(item, "power_relay_gpio", -1);
+                int power_relay_active_level = jint(item, "power_relay_active_level", 1) ? 1 : 0;
                 if (freq < 100) {
                     freq = 100;
                 }
@@ -531,20 +577,132 @@ static cJSON *normalize_config(const cJSON *src)
                 if (default_level > 100) {
                     default_level = 100;
                 }
+                if (max_level_pct < 1) {
+                    max_level_pct = 1;
+                }
+                if (max_level_pct > 100) {
+                    max_level_pct = 100;
+                }
+                if (power_relay_gpio >= 0) {
+                    char relay_owner[40] = {0};
+                    snprintf(relay_owner, sizeof(relay_owner), "pwm-power-relay:%s", id);
+                    if (!reserve_gpio(ctx, power_relay_gpio, relay_owner, "")) {
+                        return normalize_cleanup_and_fail(root, ctx);
+                    }
+                }
                 cJSON_AddNumberToObject(dst, "freq_hz", freq);
                 cJSON_AddBoolToObject(dst, "inverted", jbool(item, "inverted", false));
                 cJSON_AddNumberToObject(dst, "default_level", default_level);
-            } else {
+                cJSON_AddNumberToObject(dst, "max_level_pct", max_level_pct);
+                if (power_relay_gpio >= 0) {
+                    cJSON_AddNumberToObject(dst, "power_relay_gpio", power_relay_gpio);
+                    cJSON_AddNumberToObject(dst, "power_relay_active_level", power_relay_active_level);
+                }
+            } else if (strcmp(type, "ws2812") == 0) {
                 int pixel_count = jint(item, "pixel_count", 1);
+                int transition_ms = jint(item, "transition_ms", 300);
+                const char *mode = normalize_ws2812_mode(jstr(item, "mode", "rgb"));
+                const char *transition_style = normalize_ws2812_transition_style(
+                    jstr(item, "transition_style", "none"));
+                const char *color_order = jstr(item, "color_order", "GRB");
                 if (pixel_count < 1) {
                     pixel_count = 1;
                 }
                 if (pixel_count > 300) {
                     pixel_count = 300;
                 }
+                if (transition_ms < 0) {
+                    transition_ms = 0;
+                }
+                if (transition_ms > 5000) {
+                    transition_ms = 5000;
+                }
+                if (!is_valid_ws2812_color_order(color_order)) {
+                    color_order = "GRB";
+                }
                 cJSON_AddNumberToObject(dst, "pixel_count", pixel_count);
-                cJSON_AddStringToObject(dst, "color_order", jstr(item, "color_order", "GRB"));
+                cJSON_AddStringToObject(dst, "mode", mode);
+                cJSON_AddStringToObject(dst, "color_order", color_order);
+                cJSON_AddStringToObject(dst, "transition_style", transition_style);
+                cJSON_AddNumberToObject(dst, "transition_ms", transition_ms);
                 cJSON_AddBoolToObject(dst, "default_power_on", jbool(item, "default_power_on", false));
+            } else if (strcmp(type, "servo_3wire") == 0) {
+                int default_level = jint(item, "default_level", 0);
+                int min_us = jint(item, "min_us", 500);
+                int max_us = jint(item, "max_us", 2500);
+                if (default_level < 0) {
+                    default_level = 0;
+                }
+                if (default_level > 100) {
+                    default_level = 100;
+                }
+                if (min_us < 400) {
+                    min_us = 400;
+                }
+                if (max_us > 2600) {
+                    max_us = 2600;
+                }
+                if (max_us <= min_us) {
+                    max_us = min_us + 100;
+                }
+                cJSON_AddNumberToObject(dst, "default_level", default_level);
+                cJSON_AddNumberToObject(dst, "min_us", min_us);
+                cJSON_AddNumberToObject(dst, "max_us", max_us);
+            } else {
+                int gpio_b = jint(item, "gpio_b", -1);
+                int feedback_gpio = jint(item, "feedback_gpio", -1);
+                int default_level = jint(item, "default_level", 0);
+                int feedback_min_raw = jint(item, "feedback_min_raw", 300);
+                int feedback_max_raw = jint(item, "feedback_max_raw", 3700);
+                int deadband_pct = jint(item, "deadband_pct", 2);
+                int move_timeout_ms = jint(item, "move_timeout_ms", 15000);
+
+                char owner_b[40] = {0};
+                char owner_fb[40] = {0};
+                snprintf(owner_b, sizeof(owner_b), "servo5-b:%s", id);
+                snprintf(owner_fb, sizeof(owner_fb), "servo5-feedback:%s", id);
+
+                if (!reserve_gpio(ctx, gpio_b, owner_b, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+                if (!reserve_gpio(ctx, feedback_gpio, owner_fb, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+                if (!is_adc_feedback_gpio(feedback_gpio)) {
+                    set_error("Output %s uses GPIO%d for feedback, but only ADC-capable GPIO0..GPIO4 are supported",
+                              id, feedback_gpio);
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+                if (default_level < 0) {
+                    default_level = 0;
+                }
+                if (default_level > 100) {
+                    default_level = 100;
+                }
+                if (deadband_pct < 1) {
+                    deadband_pct = 1;
+                }
+                if (deadband_pct > 20) {
+                    deadband_pct = 20;
+                }
+                if (move_timeout_ms < 1000) {
+                    move_timeout_ms = 1000;
+                }
+                if (move_timeout_ms > 60000) {
+                    move_timeout_ms = 60000;
+                }
+                if (feedback_min_raw == feedback_max_raw) {
+                    feedback_max_raw = feedback_min_raw + 100;
+                }
+
+                cJSON_AddNumberToObject(dst, "gpio_b", gpio_b);
+                cJSON_AddNumberToObject(dst, "feedback_gpio", feedback_gpio);
+                cJSON_AddNumberToObject(dst, "default_level", default_level);
+                cJSON_AddNumberToObject(dst, "feedback_min_raw", feedback_min_raw);
+                cJSON_AddNumberToObject(dst, "feedback_max_raw", feedback_max_raw);
+                cJSON_AddNumberToObject(dst, "deadband_pct", deadband_pct);
+                cJSON_AddNumberToObject(dst, "move_timeout_ms", move_timeout_ms);
+                cJSON_AddBoolToObject(dst, "reverse_direction", jbool(item, "reverse_direction", false));
             }
 
             cJSON_AddItemToArray(outputs, dst);
