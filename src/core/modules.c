@@ -83,6 +83,13 @@ typedef struct {
     int gpio;
     bool power;
     bool supported;
+    bool test_active;
+    int64_t test_restore_at_us;
+    bool test_restore_power;
+    int test_restore_level;
+    uint8_t test_restore_red;
+    uint8_t test_restore_green;
+    uint8_t test_restore_blue;
     union {
         struct {
             int active_level;
@@ -281,6 +288,8 @@ static cJSON *build_output_status_json(const output_runtime_t *out);
 static cJSON *build_input_status_json(const input_runtime_t *in);
 static cJSON *build_button_status_json(const button_runtime_t *btn);
 static cJSON *build_sensor_status_json(const sensor_runtime_t *sensor);
+static esp_err_t start_output_test_locked(output_runtime_t *out, int duration_ms);
+static bool process_output_test_locked(output_runtime_t *out, int64_t now_us);
 static esp_err_t ensure_i2c_bus_locked(int sda_gpio, int scl_gpio, int freq_hz);
 static esp_err_t ensure_ds18b20_bus_locked(const sensor_runtime_t *sensor);
 static esp_err_t ensure_adc_channel_locked(int gpio, adc_channel_t *out_channel);
@@ -1103,6 +1112,141 @@ static esp_err_t set_output_level_locked(output_runtime_t *out, int level)
     return output_apply_physical_state(out);
 }
 
+static esp_err_t start_output_test_locked(output_runtime_t *out, int duration_ms)
+{
+    int test_level = 100;
+
+    if (!out || !out->used || !out->enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!out->supported) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (duration_ms < 100) {
+        duration_ms = 100;
+    }
+    if (duration_ms > 10000) {
+        duration_ms = 10000;
+    }
+
+    if (!out->test_active) {
+        out->test_restore_power = out->power;
+
+        switch (out->type) {
+            case OUTPUT_TYPE_PWM:
+                out->test_restore_level = out->cfg.pwm.level;
+                break;
+            case OUTPUT_TYPE_WS2812:
+                out->test_restore_level = out->cfg.ws2812.level;
+                out->test_restore_red = out->cfg.ws2812.red;
+                out->test_restore_green = out->cfg.ws2812.green;
+                out->test_restore_blue = out->cfg.ws2812.blue;
+                break;
+            case OUTPUT_TYPE_SERVO_3WIRE:
+                out->test_restore_level = out->cfg.servo_3wire.level;
+                break;
+            case OUTPUT_TYPE_SERVO_5WIRE:
+                out->test_restore_level = out->cfg.servo_5wire.target_level;
+                break;
+            default:
+                break;
+        }
+    }
+
+    out->test_active = true;
+    out->test_restore_at_us = esp_timer_get_time() + ((int64_t)duration_ms * 1000LL);
+
+    switch (out->type) {
+        case OUTPUT_TYPE_RELAY:
+            out->power = true;
+            return output_apply_physical_state(out);
+        case OUTPUT_TYPE_PWM:
+            out->cfg.pwm.level = 100;
+            out->power = true;
+            return output_apply_physical_state(out);
+        case OUTPUT_TYPE_WS2812:
+            out->cfg.ws2812.transition_active = false;
+            out->cfg.ws2812.level = 100;
+            out->cfg.ws2812.red = 255;
+            out->cfg.ws2812.green = 255;
+            out->cfg.ws2812.blue = 255;
+            out->power = true;
+            return apply_ws2812_target_locked(out, false);
+        case OUTPUT_TYPE_SERVO_3WIRE:
+            test_level = out->cfg.servo_3wire.level > 50 ? 0 : 100;
+            out->cfg.servo_3wire.level = test_level;
+            out->power = true;
+            return output_apply_physical_state(out);
+        case OUTPUT_TYPE_SERVO_5WIRE:
+            test_level = out->cfg.servo_5wire.current_level > 50 ? 0 : 100;
+            out->cfg.servo_5wire.target_level = test_level;
+            out->cfg.servo_5wire.timed_out = false;
+            (void)update_servo_5wire_control_locked(out, esp_timer_get_time());
+            return ESP_OK;
+        default:
+            out->test_active = false;
+            out->test_restore_at_us = 0;
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+static bool process_output_test_locked(output_runtime_t *out, int64_t now_us)
+{
+    esp_err_t err = ESP_OK;
+
+    if (!out || !out->test_active) {
+        return false;
+    }
+    if (now_us < out->test_restore_at_us) {
+        return false;
+    }
+
+    out->test_active = false;
+    out->test_restore_at_us = 0;
+
+    switch (out->type) {
+        case OUTPUT_TYPE_RELAY:
+            out->power = out->test_restore_power;
+            err = output_apply_physical_state(out);
+            break;
+        case OUTPUT_TYPE_PWM:
+            out->cfg.pwm.level = out->test_restore_level;
+            out->power = out->test_restore_power;
+            err = output_apply_physical_state(out);
+            break;
+        case OUTPUT_TYPE_WS2812:
+            out->cfg.ws2812.transition_active = false;
+            out->cfg.ws2812.level = out->test_restore_level;
+            out->cfg.ws2812.red = out->test_restore_red;
+            out->cfg.ws2812.green = out->test_restore_green;
+            out->cfg.ws2812.blue = out->test_restore_blue;
+            out->power = out->test_restore_power;
+            err = apply_ws2812_target_locked(out, false);
+            break;
+        case OUTPUT_TYPE_SERVO_3WIRE:
+            out->cfg.servo_3wire.level = out->test_restore_level;
+            out->power = true;
+            err = output_apply_physical_state(out);
+            break;
+        case OUTPUT_TYPE_SERVO_5WIRE:
+            out->cfg.servo_5wire.target_level = out->test_restore_level;
+            out->cfg.servo_5wire.timed_out = false;
+            (void)update_servo_5wire_control_locked(out, now_us);
+            err = ESP_OK;
+            break;
+        default:
+            err = ESP_ERR_NOT_SUPPORTED;
+            break;
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "output test restore failed for %s: %s", out->id, esp_err_to_name(err));
+    }
+
+    return true;
+}
+
 static void clear_runtime_locked(void)
 {
     for (int i = 0; i < s_runtime.output_count; ++i) {
@@ -1764,6 +1908,15 @@ static void modules_poll_task(void *arg)
         update_ws2812_transitions_locked(now_us);
         for (int i = 0; i < s_runtime.output_count; ++i) {
             output_runtime_t *out = &s_runtime.outputs[i];
+            if (!out->used || !out->enabled || !out->test_active) {
+                continue;
+            }
+            if (process_output_test_locked(out, now_us)) {
+                changed = true;
+            }
+        }
+        for (int i = 0; i < s_runtime.output_count; ++i) {
+            output_runtime_t *out = &s_runtime.outputs[i];
             if (!out->used || !out->enabled || out->type != OUTPUT_TYPE_SERVO_5WIRE) {
                 continue;
             }
@@ -1910,6 +2063,7 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
     cJSON_AddBoolToObject(obj, "supported", out->supported);
     cJSON_AddNumberToObject(obj, "gpio", out->gpio);
     cJSON_AddBoolToObject(obj, "power", out->power);
+    cJSON_AddBoolToObject(obj, "test_active", out->test_active);
 
     if (out->type == OUTPUT_TYPE_RELAY) {
         cJSON_AddNumberToObject(obj, "active_level", out->cfg.relay.active_level);
@@ -1977,6 +2131,7 @@ static cJSON *build_button_status_json(const button_runtime_t *btn)
     cJSON_AddBoolToObject(obj, "enabled", btn->enabled);
     cJSON_AddNumberToObject(obj, "gpio", btn->gpio);
     cJSON_AddNumberToObject(obj, "long_press_ms", btn->long_press_ms);
+    cJSON_AddBoolToObject(obj, "pressed", btn->last_pressed);
     cJSON *actions = cJSON_AddObjectToObject(obj, "actions");
     cJSON *short_a = cJSON_AddObjectToObject(actions, "short");
     cJSON_AddStringToObject(short_a, "type", button_action_type_to_text(btn->short_action.type));
@@ -2178,7 +2333,9 @@ esp_err_t modules_action(const char *id, const cJSON *action, cJSON **out_respon
     } else {
         output_runtime_t *out = find_output_locked(id);
         if (out) {
-            if (jbool(action, "toggle", false)) {
+            if (jbool(action, "test", false)) {
+                err = start_output_test_locked(out, jint(action, "duration_ms", 1200));
+            } else if (jbool(action, "toggle", false)) {
                 err = set_output_power_locked(out, !out->power);
             } else {
                 const cJSON *set = jobj(action, "set");

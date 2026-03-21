@@ -5,6 +5,8 @@
 #include "lwip/inet.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdbool.h>
 
@@ -43,11 +45,10 @@ static void dns_task(void *arg)
 
     int yes = 1;
     setsockopt(s_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    struct timeval rx_timeout = {
-        .tv_sec = 1,
-        .tv_usec = 0,
-    };
-    setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &rx_timeout, sizeof(rx_timeout));
+    int flags = fcntl(s_sock, F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(s_sock, F_SETFL, flags | O_NONBLOCK);
+    }
 
     if (bind(s_sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         ESP_LOGE(TAG, "bind() failed (need port 53 free)");
@@ -67,6 +68,14 @@ static void dns_task(void *arg)
         struct sockaddr_in from = {0};
         socklen_t flen = sizeof(from);
         int r = recvfrom(s_sock, rx, sizeof(rx), 0, (struct sockaddr*)&from, &flen);
+        if (r < 0) {
+            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                ESP_LOGW(TAG, "recvfrom() failed: errno=%d", errno);
+            }
+            app_watchdog_reset_current_task(TAG);
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         if (r <= (int)sizeof(dns_hdr_t)) {
             app_watchdog_reset_current_task(TAG);
             continue;
@@ -87,7 +96,10 @@ static void dns_task(void *arg)
         // Find end of question (QNAME ... 0x00 + QTYPE(2) + QCLASS(2))
         int idx = sizeof(dns_hdr_t);
         while (idx < r && tx[idx] != 0) idx++;
-        if (idx + 5 >= r) continue;
+        if (idx + 5 >= r) {
+            app_watchdog_reset_current_task(TAG);
+            continue;
+        }
         idx += 1 + 4; // zero + qtype + qclass
 
         // Answer section:

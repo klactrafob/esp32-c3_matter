@@ -314,16 +314,21 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
 
 static esp_err_t handle_module_action(httpd_req_t *req)
 {
+    static const char *prefix = "/api/modules/";
     const char *uri = req->uri;
-    const char *p = strstr(uri, "/api/modules/");
-    if (!p) {
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(uri, prefix, prefix_len) != 0) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad uri");
     }
 
-    p += strlen("/api/modules/");
+    const char *p = uri + prefix_len;
     const char *slash = strchr(p, '/');
     if (!slash) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad uri");
+    }
+
+    if (strcmp(slash, "/action") != 0) {
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown action path");
     }
 
     char id[32] = {0};
@@ -384,7 +389,7 @@ esp_err_t web_server_start(void)
     httpd_uri_t mods = {.uri = "/api/modules", .method = HTTP_GET, .handler = handle_get_modules};
     httpd_uri_t runtime = {.uri = "/api/runtime", .method = HTTP_GET, .handler = handle_get_runtime};
     httpd_uri_t wifi_scan = {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = handle_wifi_scan};
-    httpd_uri_t act = {.uri = "/api/modules/*/action", .method = HTTP_POST, .handler = handle_module_action};
+    httpd_uri_t act = {.uri = "/api/modules/*", .method = HTTP_POST, .handler = handle_module_action};
     httpd_uri_t u204 = {.uri = "/generate_204", .method = HTTP_GET, .handler = handle_generate_204};
     httpd_uri_t uios = {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect_to_root};
     httpd_uri_t uct = {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = captive_redirect_to_root};
