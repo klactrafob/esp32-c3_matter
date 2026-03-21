@@ -2,25 +2,19 @@
 .pio/
 build/
 
-# ESP-IDF Component Manager (managed components and lockfile)
+# ESP-IDF Component Manager
 managed_components/
-dependencies.lock
 
 # VS Code
-.vscode/*
-!.vscode/launch.json
-!.vscode/extensions.json
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
+.vscode/
 
-# C/C++ tools cache
-.vscode/.browse.c_cpp.db*
-.vscode/ipch/
 
 # OS junk
 .DS_Store
 Thumbs.db
 
-# ESP-IDF local backup
+# ESP-IDF local config backups
 sdkconfig.old
+sdkconfig.*
+sdkconfig*.old
+!sdkconfig

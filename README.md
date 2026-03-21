@@ -1,31 +1,50 @@
-# ESP32-C3 MQTT
+﻿# ESP32-C3 MQTT
 
-Универсальная MQTT-прошивка для ESP32-C3 с веб-конфигуратором, Wi-Fi setup portal и интеграцией с Home Assistant через MQTT Discovery.
+Universal ESP32-C3 firmware with a web configurator, Wi-Fi setup portal, and Home Assistant integration over MQTT Discovery.
 
-Проект ориентирован в первую очередь на `ESP32-C3 Super Mini`, но также подходит для `ESP32-C3 LuatOS` и совместимых плат ESP32-C3.
+## Features
 
-## Что умеет
+- Configurable outputs: `relay`, `pwm`, `ws2812`, `servo_3wire`, `servo_5wire`
+- Configurable inputs and buttons in one editor
+- Sensor support: `ds18b20_bus`, `aht20`, `sht3x`, `bme280`
+- AP mode for first-time setup
+- Startup Wi-Fi scan with cached results in the UI
+- Live output test and live input indication in the setup page
+- MQTT Discovery for Home Assistant
+- Configuration stored in NVS and managed through `/api/config` and `/api/apply`
 
-- Настраиваемые выходы: `relay`, `pwm`, `ws2812`
-- Настраиваемые входы и кнопки в едином редакторе
-- Поддержка датчиков: `ds18b20_bus`, `aht20`, `sht3x`, `bme280`
-- Wi-Fi клиент + точка доступа для первичной настройки
-- Автосканирование Wi-Fi и кэш результатов сканирования
-- Веб-интерфейс с переключением `RU/EN`
-- MQTT Discovery для Home Assistant
-- Хранение конфигурации в NVS через `/api/config` и применение через `/api/apply`
+## Repository Layout
 
-## Сценарий первого запуска
+Files required to build the project on another computer are committed to Git:
 
-1. Если Wi-Fi ещё не настроен, устройство сначала сканирует доступные сети.
-2. Затем поднимает точку доступа вида `ESP32-SETUP-XXXXXX`.
-3. Откройте веб-интерфейс по адресу `http://192.168.4.1`.
-4. Задайте параметры Wi-Fi, MQTT и конфигурацию GPIO.
-5. Сохраните настройки и примените их.
+- `platformio.ini`
+- `sdkconfig`
+- `partitions.csv`
+- `src/idf_component.yml`
+- `dependencies.lock`
+- source code in `main/`, `src/`, `include/`, `lib/`
+
+Local machine files and generated artifacts are not required and are ignored:
+
+- `.pio/`
+- `build/`
+- `managed_components/`
+- `.vscode/`
+- backup `sdkconfig*` files
+
+## First Boot
+
+1. If STA Wi-Fi is not configured, the device scans nearby networks.
+2. The device starts an access point like `ESP32-SETUP-XXXXXX`.
+3. Open `http://192.168.4.1`.
+4. Configure Wi-Fi, MQTT, and GPIO modules.
+5. Save and apply the configuration.
 
 ## MQTT
 
-Основные параметры задаются в разделе `connectivity.mqtt` конфигурации:
+Main settings are stored in `connectivity.mqtt`.
+
+Example:
 
 ```json
 {
@@ -46,39 +65,71 @@
 }
 ```
 
-Примечания:
+Notes:
 
-- `host` может быть IPv4, DNS-именем или URI вида `mqtt://192.168.1.10:1883`
-- если `client_id` пустой, используется `esp32c3-<MAC>`
-- после изменения конфигурации вызывайте `/api/apply`
+- `host` may be an IPv4 address, DNS name, or URI like `mqtt://192.168.1.10:1883`
+- if `client_id` is empty, the firmware generates a unique ID from the board MAC
+- after config changes, call `/api/apply`
 
 ## Home Assistant
 
-1. Включите MQTT integration в Home Assistant.
-2. Укажите `connectivity.mqtt.host` и при необходимости `user/pass`.
-3. Сохраните конфигурацию и выполните `POST /api/apply`.
-4. После подключения сущности появятся в Home Assistant через MQTT Discovery.
+1. Enable MQTT integration in Home Assistant.
+2. Configure the same broker host and credentials.
+3. Save the device config and run `POST /api/apply`.
+4. Entities appear automatically through MQTT Discovery.
 
-## Сборка через ESP-IDF
+## Build With PlatformIO
 
-```bat
+Requirements:
+
+- PlatformIO Core
+- ESP-IDF toolchain installed through PlatformIO
+
+Build:
+
+```bash
+pio run
+```
+
+Flash:
+
+```bash
+pio run -t upload
+```
+
+Monitor:
+
+```bash
+pio device monitor -b 115200
+```
+
+## Build With ESP-IDF
+
+Requirements:
+
+- ESP-IDF 5.5.x
+- Python environment from ESP-IDF install
+
+Build:
+
+```bash
 idf.py build
 ```
 
-## Прошивка
+Flash:
 
-```bat
-idf.py -p COM8 flash
+```bash
+idf.py -p COM5 flash
 ```
 
-## Монитор
+Monitor:
 
-```bat
-idf.py -p COM8 monitor
+```bash
+idf.py -p COM5 monitor
 ```
 
-## Сборка через PlatformIO
+## Dependency Management
 
-```bat
-pio run
-```
+Component versions are pinned in `dependencies.lock`.
+
+On a fresh machine, dependencies are restored automatically during the first build.
