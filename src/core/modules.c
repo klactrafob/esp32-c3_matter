@@ -2174,7 +2174,7 @@ static cJSON *build_sensor_status_json(const sensor_runtime_t *sensor)
         cJSON *devices = cJSON_AddArrayToObject(obj, "devices");
         for (int i = 0; i < s_runtime.ds18b20.device_count; ++i) {
             cJSON *dev = cJSON_CreateObject();
-            char dev_id[40] = {0};
+            char dev_id[48] = {0};
             char dev_name[64] = {0};
             snprintf(dev_id, sizeof(dev_id), "%s_%016" PRIX64, sensor->id, (uint64_t)s_runtime.ds18b20.addresses[i]);
             snprintf(dev_name, sizeof(dev_name), "%s %d", sensor->name, i + 1);
