@@ -14,6 +14,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -35,6 +36,8 @@ static const char *TAG = "modules";
 #define MODULES_POLL_PERIOD_MS 50
 #define MODULES_SENSOR_TASK_PERIOD_MS 200
 #define MODULES_DEFAULT_I2C_PORT I2C_NUM_0
+#define LEVEL_PCT_MAX 100
+#define WS2812_BRIGHTNESS_MAX 255
 
 typedef enum {
     OUTPUT_TYPE_NONE = 0,
@@ -43,6 +46,8 @@ typedef enum {
     OUTPUT_TYPE_WS2812,
     OUTPUT_TYPE_SERVO_3WIRE,
     OUTPUT_TYPE_SERVO_5WIRE,
+    OUTPUT_TYPE_STEPPER_28BYJ,
+    OUTPUT_TYPE_STEPPER_A4988,
 } output_type_t;
 
 typedef enum {
@@ -109,6 +114,7 @@ typedef struct {
             int pixel_count;
             char color_order[8];
             bool default_power_on;
+            bool gamma_correction;
             int level;
             uint8_t red;
             uint8_t green;
@@ -158,6 +164,52 @@ typedef struct {
             bool timed_out;
             int64_t drive_started_us;
         } servo_5wire;
+        struct {
+            int gpio_b;
+            int gpio_c;
+            int gpio_d;
+            int home_gpio;
+            gpio_pull_mode_t home_pull_mode;
+            bool home_inverted;
+            bool auto_home_on_boot;
+            int steps_range;
+            int speed_steps_per_sec;
+            bool reverse_direction;
+            bool hold_enabled;
+            int target_level;
+            int current_level;
+            int target_position_steps;
+            int current_position_steps;
+            int phase_index;
+            bool home_active;
+            bool homing;
+            bool homed;
+            bool moving;
+            int64_t last_step_us;
+        } stepper_28byj;
+        struct {
+            int gpio_b;
+            int gpio_c;
+            int home_gpio;
+            gpio_pull_mode_t home_pull_mode;
+            bool home_inverted;
+            bool auto_home_on_boot;
+            int enable_active_level;
+            int steps_range;
+            int speed_steps_per_sec;
+            int step_pulse_us;
+            bool reverse_direction;
+            bool hold_enabled;
+            int target_level;
+            int current_level;
+            int target_position_steps;
+            int current_position_steps;
+            bool home_active;
+            bool homing;
+            bool homed;
+            bool moving;
+            int64_t last_step_us;
+        } stepper_a4988;
     } cfg;
 } output_runtime_t;
 
@@ -268,6 +320,7 @@ static const char *jstr(const cJSON *obj, const char *key, const char *def);
 static bool jbool(const cJSON *obj, const char *key, bool def);
 static int jint(const cJSON *obj, const char *key, int def);
 static gpio_pull_mode_t pull_mode_from_text(const char *pull);
+static const char *pull_mode_to_text(gpio_pull_mode_t pull);
 static output_type_t output_type_from_text(const char *type);
 static const char *output_type_to_text(output_type_t type);
 static ws2812_mode_t ws2812_mode_from_text(const char *mode);
@@ -280,6 +333,7 @@ static void notify_runtime_changed(void);
 static esp_err_t output_apply_physical_state(output_runtime_t *out);
 static esp_err_t set_output_power_locked(output_runtime_t *out, bool on);
 static esp_err_t set_output_level_locked(output_runtime_t *out, int level);
+static esp_err_t set_output_brightness_locked(output_runtime_t *out, int brightness);
 static esp_err_t set_master_output_locked(bool on);
 static bool is_any_output_on_locked(void);
 static output_runtime_t *find_output_locked(const char *id);
@@ -302,6 +356,20 @@ static esp_err_t servo_5wire_set_drive_locked(output_runtime_t *out, int logical
 static int servo_5wire_feedback_to_level_locked(const output_runtime_t *out, int raw);
 static esp_err_t servo_5wire_read_feedback_locked(output_runtime_t *out, int *out_raw, int *out_level);
 static bool update_servo_5wire_control_locked(output_runtime_t *out, int64_t now_us);
+static int stepper_level_to_position(int level, int steps_range);
+static int stepper_position_to_level(int position_steps, int steps_range);
+static esp_err_t stepper_28byj_apply_phase_locked(output_runtime_t *out, int phase_index);
+static esp_err_t stepper_28byj_release_locked(output_runtime_t *out);
+static bool stepper_28byj_home_active_locked(output_runtime_t *out);
+static void stepper_28byj_finish_home_locked(output_runtime_t *out);
+static esp_err_t stepper_28byj_start_home_locked(output_runtime_t *out);
+static esp_err_t stepper_a4988_set_enable_locked(output_runtime_t *out, bool enabled);
+static esp_err_t stepper_a4988_step_locked(output_runtime_t *out, int logical_direction);
+static bool stepper_a4988_home_active_locked(output_runtime_t *out);
+static void stepper_a4988_finish_home_locked(output_runtime_t *out);
+static esp_err_t stepper_a4988_start_home_locked(output_runtime_t *out);
+static bool update_stepper_28byj_control_locked(output_runtime_t *out, int64_t now_us);
+static bool update_stepper_a4988_control_locked(output_runtime_t *out, int64_t now_us);
 static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, uint8_t red, uint8_t green, uint8_t blue, int wipe_active_segments);
 static esp_err_t apply_ws2812_target_locked(output_runtime_t *out, bool allow_transition);
 static void update_ws2812_transitions_locked(int64_t now_us);
@@ -352,6 +420,19 @@ static gpio_pull_mode_t pull_mode_from_text(const char *pull)
     return GPIO_PULLUP_ONLY;
 }
 
+static const char *pull_mode_to_text(gpio_pull_mode_t pull)
+{
+    switch (pull) {
+        case GPIO_PULLDOWN_ONLY:
+            return "down";
+        case GPIO_FLOATING:
+            return "none";
+        case GPIO_PULLUP_ONLY:
+        default:
+            return "up";
+    }
+}
+
 static output_type_t output_type_from_text(const char *type)
 {
     if (strcmp(type, "relay") == 0) {
@@ -369,6 +450,12 @@ static output_type_t output_type_from_text(const char *type)
     if (strcmp(type, "servo_5wire") == 0) {
         return OUTPUT_TYPE_SERVO_5WIRE;
     }
+    if (strcmp(type, "stepper_28byj") == 0) {
+        return OUTPUT_TYPE_STEPPER_28BYJ;
+    }
+    if (strcmp(type, "stepper_a4988") == 0) {
+        return OUTPUT_TYPE_STEPPER_A4988;
+    }
     return OUTPUT_TYPE_NONE;
 }
 
@@ -380,6 +467,8 @@ static const char *output_type_to_text(output_type_t type)
         case OUTPUT_TYPE_WS2812: return "ws2812";
         case OUTPUT_TYPE_SERVO_3WIRE: return "servo_3wire";
         case OUTPUT_TYPE_SERVO_5WIRE: return "servo_5wire";
+        case OUTPUT_TYPE_STEPPER_28BYJ: return "stepper_28byj";
+        case OUTPUT_TYPE_STEPPER_A4988: return "stepper_a4988";
         default: return "unknown";
     }
 }
@@ -489,7 +578,9 @@ static bool output_supports_level_control(const output_runtime_t *out)
     return out->type == OUTPUT_TYPE_PWM ||
            out->type == OUTPUT_TYPE_WS2812 ||
            out->type == OUTPUT_TYPE_SERVO_3WIRE ||
-           out->type == OUTPUT_TYPE_SERVO_5WIRE;
+           out->type == OUTPUT_TYPE_SERVO_5WIRE ||
+           out->type == OUTPUT_TYPE_STEPPER_28BYJ ||
+           out->type == OUTPUT_TYPE_STEPPER_A4988;
 }
 
 static esp_err_t set_pwm_power_relay_locked(output_runtime_t *out, bool on)
@@ -701,6 +792,463 @@ static bool update_servo_5wire_control_locked(output_runtime_t *out, int64_t now
     return changed;
 }
 
+static int stepper_level_to_position(int level, int steps_range)
+{
+    if (steps_range < 1) {
+        steps_range = 1;
+    }
+    if (level < 0) {
+        level = 0;
+    }
+    if (level > 100) {
+        level = 100;
+    }
+    return (level * steps_range + 50) / 100;
+}
+
+static int stepper_position_to_level(int position_steps, int steps_range)
+{
+    if (steps_range < 1) {
+        steps_range = 1;
+    }
+    if (position_steps < 0) {
+        position_steps = 0;
+    }
+    if (position_steps > steps_range) {
+        position_steps = steps_range;
+    }
+    return (position_steps * 100 + (steps_range / 2)) / steps_range;
+}
+
+static esp_err_t stepper_28byj_apply_phase_locked(output_runtime_t *out, int phase_index)
+{
+    static const uint8_t k_half_step[8][4] = {
+        {1, 0, 0, 0},
+        {1, 1, 0, 0},
+        {0, 1, 0, 0},
+        {0, 1, 1, 0},
+        {0, 0, 1, 0},
+        {0, 0, 1, 1},
+        {0, 0, 0, 1},
+        {1, 0, 0, 1},
+    };
+
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_28BYJ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    phase_index %= 8;
+    if (phase_index < 0) {
+        phase_index += 8;
+    }
+
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->gpio, k_half_step[phase_index][0]), TAG, "stepper 28byj phase a failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.stepper_28byj.gpio_b, k_half_step[phase_index][1]), TAG, "stepper 28byj phase b failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.stepper_28byj.gpio_c, k_half_step[phase_index][2]), TAG, "stepper 28byj phase c failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.stepper_28byj.gpio_d, k_half_step[phase_index][3]), TAG, "stepper 28byj phase d failed");
+    out->cfg.stepper_28byj.phase_index = phase_index;
+    return ESP_OK;
+}
+
+static esp_err_t stepper_28byj_release_locked(output_runtime_t *out)
+{
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_28BYJ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->gpio, 0), TAG, "stepper 28byj release a failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.stepper_28byj.gpio_b, 0), TAG, "stepper 28byj release b failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.stepper_28byj.gpio_c, 0), TAG, "stepper 28byj release c failed");
+    return gpio_set_level((gpio_num_t)out->cfg.stepper_28byj.gpio_d, 0);
+}
+
+static bool stepper_28byj_home_active_locked(output_runtime_t *out)
+{
+    bool active = false;
+
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_28BYJ || out->cfg.stepper_28byj.home_gpio < 0) {
+        return false;
+    }
+
+    active = gpio_get_level((gpio_num_t)out->cfg.stepper_28byj.home_gpio) != 0;
+    if (out->cfg.stepper_28byj.home_inverted) {
+        active = !active;
+    }
+    out->cfg.stepper_28byj.home_active = active;
+    return active;
+}
+
+static void stepper_28byj_finish_home_locked(output_runtime_t *out)
+{
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_28BYJ) {
+        return;
+    }
+
+    out->cfg.stepper_28byj.current_position_steps = 0;
+    out->cfg.stepper_28byj.target_position_steps = 0;
+    out->cfg.stepper_28byj.current_level = 0;
+    out->cfg.stepper_28byj.target_level = 0;
+    out->cfg.stepper_28byj.last_step_us = 0;
+    out->cfg.stepper_28byj.homing = false;
+    out->cfg.stepper_28byj.homed = true;
+    out->cfg.stepper_28byj.home_active = true;
+    out->cfg.stepper_28byj.moving = false;
+
+    if (out->cfg.stepper_28byj.hold_enabled) {
+        (void)stepper_28byj_apply_phase_locked(out, out->cfg.stepper_28byj.phase_index);
+        out->power = true;
+    } else {
+        (void)stepper_28byj_release_locked(out);
+        out->power = false;
+    }
+}
+
+static esp_err_t stepper_28byj_start_home_locked(output_runtime_t *out)
+{
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_28BYJ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (out->cfg.stepper_28byj.home_gpio < 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (stepper_28byj_home_active_locked(out)) {
+        stepper_28byj_finish_home_locked(out);
+        return ESP_OK;
+    }
+
+    out->cfg.stepper_28byj.homing = true;
+    out->cfg.stepper_28byj.homed = false;
+    out->cfg.stepper_28byj.target_position_steps = 0;
+    out->cfg.stepper_28byj.target_level = 0;
+    out->cfg.stepper_28byj.last_step_us = 0;
+    out->cfg.stepper_28byj.moving = true;
+    out->power = true;
+    return ESP_OK;
+}
+
+static esp_err_t stepper_a4988_set_enable_locked(output_runtime_t *out, bool enabled)
+{
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_A4988) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (out->cfg.stepper_a4988.gpio_c < 0) {
+        return ESP_OK;
+    }
+    return gpio_set_level((gpio_num_t)out->cfg.stepper_a4988.gpio_c,
+                          enabled ? out->cfg.stepper_a4988.enable_active_level
+                                  : (1 - out->cfg.stepper_a4988.enable_active_level));
+}
+
+static esp_err_t stepper_a4988_step_locked(output_runtime_t *out, int logical_direction)
+{
+    int dir_level;
+
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_A4988 || logical_direction == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    dir_level = logical_direction > 0 ? 1 : 0;
+    if (out->cfg.stepper_a4988.reverse_direction) {
+        dir_level = 1 - dir_level;
+    }
+
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.stepper_a4988.gpio_b, dir_level), TAG, "stepper a4988 dir failed");
+    ESP_RETURN_ON_ERROR(stepper_a4988_set_enable_locked(out, true), TAG, "stepper a4988 enable failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->gpio, 1), TAG, "stepper a4988 step high failed");
+    esp_rom_delay_us((uint32_t)out->cfg.stepper_a4988.step_pulse_us);
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->gpio, 0), TAG, "stepper a4988 step low failed");
+    esp_rom_delay_us((uint32_t)out->cfg.stepper_a4988.step_pulse_us);
+    return ESP_OK;
+}
+
+static bool stepper_a4988_home_active_locked(output_runtime_t *out)
+{
+    bool active = false;
+
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_A4988 || out->cfg.stepper_a4988.home_gpio < 0) {
+        return false;
+    }
+
+    active = gpio_get_level((gpio_num_t)out->cfg.stepper_a4988.home_gpio) != 0;
+    if (out->cfg.stepper_a4988.home_inverted) {
+        active = !active;
+    }
+    out->cfg.stepper_a4988.home_active = active;
+    return active;
+}
+
+static void stepper_a4988_finish_home_locked(output_runtime_t *out)
+{
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_A4988) {
+        return;
+    }
+
+    out->cfg.stepper_a4988.current_position_steps = 0;
+    out->cfg.stepper_a4988.target_position_steps = 0;
+    out->cfg.stepper_a4988.current_level = 0;
+    out->cfg.stepper_a4988.target_level = 0;
+    out->cfg.stepper_a4988.last_step_us = 0;
+    out->cfg.stepper_a4988.homing = false;
+    out->cfg.stepper_a4988.homed = true;
+    out->cfg.stepper_a4988.home_active = true;
+    out->cfg.stepper_a4988.moving = false;
+
+    if (out->cfg.stepper_a4988.hold_enabled) {
+        (void)stepper_a4988_set_enable_locked(out, true);
+        out->power = true;
+    } else {
+        (void)stepper_a4988_set_enable_locked(out, false);
+        out->power = false;
+    }
+}
+
+static esp_err_t stepper_a4988_start_home_locked(output_runtime_t *out)
+{
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_A4988) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (out->cfg.stepper_a4988.home_gpio < 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (stepper_a4988_home_active_locked(out)) {
+        stepper_a4988_finish_home_locked(out);
+        return ESP_OK;
+    }
+
+    out->cfg.stepper_a4988.homing = true;
+    out->cfg.stepper_a4988.homed = false;
+    out->cfg.stepper_a4988.target_position_steps = 0;
+    out->cfg.stepper_a4988.target_level = 0;
+    out->cfg.stepper_a4988.last_step_us = 0;
+    out->cfg.stepper_a4988.moving = true;
+    out->power = true;
+    return ESP_OK;
+}
+
+static bool update_stepper_28byj_control_locked(output_runtime_t *out, int64_t now_us)
+{
+    bool changed = false;
+    bool previous_home_active;
+    bool previous_homing;
+    bool previous_homed;
+    bool previous_moving;
+    int speed;
+    int64_t step_interval_us;
+    int steps_due = 0;
+
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_28BYJ || !out->enabled || !out->supported) {
+        return false;
+    }
+
+    previous_home_active = out->cfg.stepper_28byj.home_active;
+    previous_homing = out->cfg.stepper_28byj.homing;
+    previous_homed = out->cfg.stepper_28byj.homed;
+    previous_moving = out->cfg.stepper_28byj.moving;
+
+    if (out->cfg.stepper_28byj.home_gpio >= 0 && stepper_28byj_home_active_locked(out)) {
+        if (out->cfg.stepper_28byj.homing ||
+            (out->cfg.stepper_28byj.current_position_steps > 0 &&
+             out->cfg.stepper_28byj.target_position_steps <= out->cfg.stepper_28byj.current_position_steps)) {
+            stepper_28byj_finish_home_locked(out);
+        } else {
+            out->cfg.stepper_28byj.homed = true;
+        }
+    }
+
+    speed = out->cfg.stepper_28byj.speed_steps_per_sec;
+    if (speed < 1) {
+        speed = 1;
+    }
+    step_interval_us = 1000000LL / speed;
+    if (step_interval_us < 1000LL) {
+        step_interval_us = 1000LL;
+    }
+
+    if (out->cfg.stepper_28byj.current_position_steps != out->cfg.stepper_28byj.target_position_steps) {
+        if (out->cfg.stepper_28byj.last_step_us <= 0) {
+            out->cfg.stepper_28byj.last_step_us = now_us - step_interval_us;
+        }
+        if (now_us >= out->cfg.stepper_28byj.last_step_us + step_interval_us) {
+            steps_due = (int)((now_us - out->cfg.stepper_28byj.last_step_us) / step_interval_us);
+            if (steps_due < 1) {
+                steps_due = 1;
+            }
+            if (steps_due > 64) {
+                steps_due = 64;
+            }
+        }
+    }
+
+    while (steps_due-- > 0 &&
+           out->cfg.stepper_28byj.current_position_steps != out->cfg.stepper_28byj.target_position_steps) {
+        int logical_direction = (out->cfg.stepper_28byj.target_position_steps > out->cfg.stepper_28byj.current_position_steps) ? 1 : -1;
+        int phase_delta = out->cfg.stepper_28byj.reverse_direction ? -logical_direction : logical_direction;
+        int next_phase = out->cfg.stepper_28byj.phase_index + phase_delta;
+
+        if (out->cfg.stepper_28byj.home_gpio >= 0 && logical_direction < 0 && stepper_28byj_home_active_locked(out)) {
+            stepper_28byj_finish_home_locked(out);
+            changed = true;
+            break;
+        }
+
+        if (stepper_28byj_apply_phase_locked(out, next_phase) != ESP_OK) {
+            break;
+        }
+
+        out->cfg.stepper_28byj.current_position_steps += logical_direction;
+        if (out->cfg.stepper_28byj.current_position_steps < 0) {
+            out->cfg.stepper_28byj.current_position_steps = 0;
+        }
+        if (out->cfg.stepper_28byj.current_position_steps > out->cfg.stepper_28byj.steps_range) {
+            out->cfg.stepper_28byj.current_position_steps = out->cfg.stepper_28byj.steps_range;
+        }
+        out->cfg.stepper_28byj.current_level =
+            stepper_position_to_level(out->cfg.stepper_28byj.current_position_steps, out->cfg.stepper_28byj.steps_range);
+        out->cfg.stepper_28byj.last_step_us += step_interval_us;
+        changed = true;
+
+        if (out->cfg.stepper_28byj.home_gpio >= 0 && logical_direction < 0 && stepper_28byj_home_active_locked(out)) {
+            stepper_28byj_finish_home_locked(out);
+            break;
+        }
+    }
+
+    out->cfg.stepper_28byj.moving =
+        out->cfg.stepper_28byj.current_position_steps != out->cfg.stepper_28byj.target_position_steps;
+
+    if (!out->cfg.stepper_28byj.moving) {
+        if (out->cfg.stepper_28byj.hold_enabled) {
+            (void)stepper_28byj_apply_phase_locked(out, out->cfg.stepper_28byj.phase_index);
+            out->power = true;
+        } else {
+            (void)stepper_28byj_release_locked(out);
+            out->power = false;
+        }
+    } else {
+        out->power = true;
+    }
+
+    changed = changed ||
+              previous_home_active != out->cfg.stepper_28byj.home_active ||
+              previous_homing != out->cfg.stepper_28byj.homing ||
+              previous_homed != out->cfg.stepper_28byj.homed ||
+              previous_moving != out->cfg.stepper_28byj.moving;
+
+    return changed;
+}
+
+static bool update_stepper_a4988_control_locked(output_runtime_t *out, int64_t now_us)
+{
+    bool changed = false;
+    bool previous_home_active;
+    bool previous_homing;
+    bool previous_homed;
+    bool previous_moving;
+    int speed;
+    int64_t step_interval_us;
+    int steps_due = 0;
+
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_A4988 || !out->enabled || !out->supported) {
+        return false;
+    }
+
+    previous_home_active = out->cfg.stepper_a4988.home_active;
+    previous_homing = out->cfg.stepper_a4988.homing;
+    previous_homed = out->cfg.stepper_a4988.homed;
+    previous_moving = out->cfg.stepper_a4988.moving;
+
+    if (out->cfg.stepper_a4988.home_gpio >= 0 && stepper_a4988_home_active_locked(out)) {
+        if (out->cfg.stepper_a4988.homing ||
+            (out->cfg.stepper_a4988.current_position_steps > 0 &&
+             out->cfg.stepper_a4988.target_position_steps <= out->cfg.stepper_a4988.current_position_steps)) {
+            stepper_a4988_finish_home_locked(out);
+        } else {
+            out->cfg.stepper_a4988.homed = true;
+        }
+    }
+
+    speed = out->cfg.stepper_a4988.speed_steps_per_sec;
+    if (speed < 1) {
+        speed = 1;
+    }
+    step_interval_us = 1000000LL / speed;
+    if (step_interval_us < 1000LL) {
+        step_interval_us = 1000LL;
+    }
+
+    if (out->cfg.stepper_a4988.current_position_steps != out->cfg.stepper_a4988.target_position_steps) {
+        if (out->cfg.stepper_a4988.last_step_us <= 0) {
+            out->cfg.stepper_a4988.last_step_us = now_us - step_interval_us;
+        }
+        if (now_us >= out->cfg.stepper_a4988.last_step_us + step_interval_us) {
+            steps_due = (int)((now_us - out->cfg.stepper_a4988.last_step_us) / step_interval_us);
+            if (steps_due < 1) {
+                steps_due = 1;
+            }
+            if (steps_due > 64) {
+                steps_due = 64;
+            }
+        }
+    }
+
+    while (steps_due-- > 0 &&
+           out->cfg.stepper_a4988.current_position_steps != out->cfg.stepper_a4988.target_position_steps) {
+        int logical_direction = (out->cfg.stepper_a4988.target_position_steps > out->cfg.stepper_a4988.current_position_steps) ? 1 : -1;
+
+        if (out->cfg.stepper_a4988.home_gpio >= 0 && logical_direction < 0 && stepper_a4988_home_active_locked(out)) {
+            stepper_a4988_finish_home_locked(out);
+            changed = true;
+            break;
+        }
+
+        if (stepper_a4988_step_locked(out, logical_direction) != ESP_OK) {
+            break;
+        }
+
+        out->cfg.stepper_a4988.current_position_steps += logical_direction;
+        if (out->cfg.stepper_a4988.current_position_steps < 0) {
+            out->cfg.stepper_a4988.current_position_steps = 0;
+        }
+        if (out->cfg.stepper_a4988.current_position_steps > out->cfg.stepper_a4988.steps_range) {
+            out->cfg.stepper_a4988.current_position_steps = out->cfg.stepper_a4988.steps_range;
+        }
+        out->cfg.stepper_a4988.current_level =
+            stepper_position_to_level(out->cfg.stepper_a4988.current_position_steps, out->cfg.stepper_a4988.steps_range);
+        out->cfg.stepper_a4988.last_step_us += step_interval_us;
+        changed = true;
+
+        if (out->cfg.stepper_a4988.home_gpio >= 0 && logical_direction < 0 && stepper_a4988_home_active_locked(out)) {
+            stepper_a4988_finish_home_locked(out);
+            break;
+        }
+    }
+
+    out->cfg.stepper_a4988.moving =
+        out->cfg.stepper_a4988.current_position_steps != out->cfg.stepper_a4988.target_position_steps;
+
+    if (!out->cfg.stepper_a4988.moving) {
+        if (out->cfg.stepper_a4988.hold_enabled) {
+            (void)stepper_a4988_set_enable_locked(out, true);
+            out->power = true;
+        } else {
+            (void)stepper_a4988_set_enable_locked(out, false);
+            out->power = false;
+        }
+    } else {
+        out->power = true;
+    }
+
+    changed = changed ||
+              previous_home_active != out->cfg.stepper_a4988.home_active ||
+              previous_homing != out->cfg.stepper_a4988.homing ||
+              previous_homed != out->cfg.stepper_a4988.homed ||
+              previous_moving != out->cfg.stepper_a4988.moving;
+
+    return changed;
+}
+
 static bool ws2812_color_order_valid(const char *order)
 {
     static const char *const k_valid_orders[] = {
@@ -730,9 +1278,72 @@ static uint8_t ws2812_channel_value(char channel, uint8_t red, uint8_t green, ui
     }
 }
 
+static int clamp_level_pct(int level)
+{
+    if (level < 0) {
+        return 0;
+    }
+    if (level > LEVEL_PCT_MAX) {
+        return LEVEL_PCT_MAX;
+    }
+    return level;
+}
+
+static int clamp_ws2812_brightness(int brightness)
+{
+    if (brightness < 0) {
+        return 0;
+    }
+    if (brightness > WS2812_BRIGHTNESS_MAX) {
+        return WS2812_BRIGHTNESS_MAX;
+    }
+    return brightness;
+}
+
+static int ws2812_brightness_from_percent(int level_pct)
+{
+    int clamped = clamp_level_pct(level_pct);
+    return (clamped * WS2812_BRIGHTNESS_MAX + (LEVEL_PCT_MAX / 2)) / LEVEL_PCT_MAX;
+}
+
+static int ws2812_percent_from_brightness(int brightness)
+{
+    int clamped = clamp_ws2812_brightness(brightness);
+    return (clamped * LEVEL_PCT_MAX + (WS2812_BRIGHTNESS_MAX / 2)) / WS2812_BRIGHTNESS_MAX;
+}
+
+static uint8_t ws2812_apply_gamma(uint8_t value)
+{
+    static const uint8_t k_gamma_lut[256] = {
+          0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,
+          1,   1,   1,   1,   1,   1,   1,   1,   1,   2,   2,   2,   2,   2,   2,   2,
+          3,   3,   3,   3,   3,   4,   4,   4,   4,   5,   5,   5,   5,   6,   6,   6,
+          6,   7,   7,   7,   8,   8,   8,   9,   9,   9,  10,  10,  11,  11,  11,  12,
+         12,  13,  13,  13,  14,  14,  15,  15,  16,  16,  17,  17,  18,  18,  19,  19,
+         20,  20,  21,  22,  22,  23,  23,  24,  25,  25,  26,  26,  27,  28,  28,  29,
+         30,  30,  31,  32,  33,  33,  34,  35,  35,  36,  37,  38,  39,  39,  40,  41,
+         42,  43,  43,  44,  45,  46,  47,  48,  49,  49,  50,  51,  52,  53,  54,  55,
+         56,  57,  58,  59,  60,  61,  62,  63,  64,  65,  66,  67,  68,  69,  70,  71,
+         73,  74,  75,  76,  77,  78,  79,  81,  82,  83,  84,  85,  87,  88,  89,  90,
+         91,  93,  94,  95,  97,  98,  99, 100, 102, 103, 105, 106, 107, 109, 110, 111,
+        113, 114, 116, 117, 119, 120, 121, 123, 124, 126, 127, 129, 130, 132, 133, 135,
+        137, 138, 140, 141, 143, 145, 146, 148, 149, 151, 153, 154, 156, 158, 159, 161,
+        163, 165, 166, 168, 170, 172, 173, 175, 177, 179, 181, 182, 184, 186, 188, 190,
+        192, 194, 196, 197, 199, 201, 203, 205, 207, 209, 211, 213, 215, 217, 219, 221,
+        223, 225, 227, 229, 231, 234, 236, 238, 240, 242, 244, 246, 248, 251, 253, 255,
+    };
+
+    return k_gamma_lut[value];
+}
+
 static esp_err_t ws2812_set_pixel_ordered(output_runtime_t *out, int index, uint8_t red, uint8_t green, uint8_t blue)
 {
     const char *order = ws2812_color_order_valid(out->cfg.ws2812.color_order) ? out->cfg.ws2812.color_order : "GRB";
+    if (out->cfg.ws2812.gamma_correction) {
+        red = ws2812_apply_gamma(red);
+        green = ws2812_apply_gamma(green);
+        blue = ws2812_apply_gamma(blue);
+    }
     uint8_t wire_0 = ws2812_channel_value(order[0], red, green, blue);
     uint8_t wire_1 = ws2812_channel_value(order[1], red, green, blue);
     uint8_t wire_2 = ws2812_channel_value(order[2], red, green, blue);
@@ -746,12 +1357,7 @@ static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, ui
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (level < 0) {
-        level = 0;
-    }
-    if (level > 100) {
-        level = 100;
-    }
+    level = clamp_ws2812_brightness(level);
 
     if (level <= 0) {
         ESP_ERROR_CHECK(led_strip_clear(out->cfg.ws2812.strip));
@@ -761,7 +1367,7 @@ static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, ui
     if (out->cfg.ws2812.mode == WS2812_MODE_MONO_TRIPLET) {
         int total_segments = out->cfg.ws2812.pixel_count * 3;
         int active_segments = wipe_active_segments;
-        uint8_t mono = (uint8_t)(((uint32_t)255U * (uint32_t)level) / 100U);
+        uint8_t mono = (uint8_t)level;
         const char *order = ws2812_color_order_valid(out->cfg.ws2812.color_order) ? out->cfg.ws2812.color_order : "GRB";
 
         if (active_segments < 0 || active_segments > total_segments) {
@@ -794,9 +1400,9 @@ static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, ui
             ESP_ERROR_CHECK(ws2812_set_pixel_ordered(out, pixel, pixel_r, pixel_g, pixel_b));
         }
     } else {
-        uint8_t scaled_r = (uint8_t)(((uint32_t)red * (uint32_t)level) / 100U);
-        uint8_t scaled_g = (uint8_t)(((uint32_t)green * (uint32_t)level) / 100U);
-        uint8_t scaled_b = (uint8_t)(((uint32_t)blue * (uint32_t)level) / 100U);
+        uint8_t scaled_r = (uint8_t)(((uint32_t)red * (uint32_t)level) / WS2812_BRIGHTNESS_MAX);
+        uint8_t scaled_g = (uint8_t)(((uint32_t)green * (uint32_t)level) / WS2812_BRIGHTNESS_MAX);
+        uint8_t scaled_b = (uint8_t)(((uint32_t)blue * (uint32_t)level) / WS2812_BRIGHTNESS_MAX);
 
         for (int i = 0; i < out->cfg.ws2812.pixel_count; ++i) {
             ESP_ERROR_CHECK(ws2812_set_pixel_ordered(out, i, scaled_r, scaled_g, scaled_b));
@@ -1080,19 +1686,13 @@ static esp_err_t set_output_level_locked(output_runtime_t *out, int level)
     if (!out || !out->enabled) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (level < 0) {
-        level = 0;
-    }
-    if (level > 100) {
-        level = 100;
-    }
+    level = clamp_level_pct(level);
 
     if (out->type == OUTPUT_TYPE_PWM) {
         out->cfg.pwm.level = level;
         out->power = (level > 0);
     } else if (out->type == OUTPUT_TYPE_WS2812) {
-        out->cfg.ws2812.level = level;
-        out->power = (level > 0);
+        return set_output_brightness_locked(out, ws2812_brightness_from_percent(level));
     } else if (out->type == OUTPUT_TYPE_SERVO_3WIRE) {
         out->cfg.servo_3wire.level = level;
         out->power = true;
@@ -1100,6 +1700,40 @@ static esp_err_t set_output_level_locked(output_runtime_t *out, int level)
         out->cfg.servo_5wire.target_level = level;
         out->cfg.servo_5wire.timed_out = false;
         out->power = out->cfg.servo_5wire.moving;
+    } else if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+        out->cfg.stepper_28byj.homing = false;
+        out->cfg.stepper_28byj.target_level = level;
+        out->cfg.stepper_28byj.target_position_steps = stepper_level_to_position(level, out->cfg.stepper_28byj.steps_range);
+        if (out->cfg.stepper_28byj.home_gpio >= 0 && level == 0 && stepper_28byj_home_active_locked(out)) {
+            stepper_28byj_finish_home_locked(out);
+            return ESP_OK;
+        }
+        out->cfg.stepper_28byj.last_step_us = 0;
+        out->cfg.stepper_28byj.moving =
+            out->cfg.stepper_28byj.current_position_steps != out->cfg.stepper_28byj.target_position_steps;
+        out->power = out->cfg.stepper_28byj.moving || out->cfg.stepper_28byj.hold_enabled;
+        if (!out->cfg.stepper_28byj.moving && !out->cfg.stepper_28byj.hold_enabled) {
+            (void)stepper_28byj_release_locked(out);
+            out->power = false;
+        }
+        return ESP_OK;
+    } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+        out->cfg.stepper_a4988.homing = false;
+        out->cfg.stepper_a4988.target_level = level;
+        out->cfg.stepper_a4988.target_position_steps = stepper_level_to_position(level, out->cfg.stepper_a4988.steps_range);
+        if (out->cfg.stepper_a4988.home_gpio >= 0 && level == 0 && stepper_a4988_home_active_locked(out)) {
+            stepper_a4988_finish_home_locked(out);
+            return ESP_OK;
+        }
+        out->cfg.stepper_a4988.last_step_us = 0;
+        out->cfg.stepper_a4988.moving =
+            out->cfg.stepper_a4988.current_position_steps != out->cfg.stepper_a4988.target_position_steps;
+        out->power = out->cfg.stepper_a4988.moving || out->cfg.stepper_a4988.hold_enabled;
+        if (!out->cfg.stepper_a4988.moving && !out->cfg.stepper_a4988.hold_enabled) {
+            (void)stepper_a4988_set_enable_locked(out, false);
+            out->power = false;
+        }
+        return ESP_OK;
     } else {
         return ESP_ERR_INVALID_ARG;
     }
@@ -1109,6 +1743,18 @@ static esp_err_t set_output_level_locked(output_runtime_t *out, int level)
         return ESP_OK;
     }
 
+    return output_apply_physical_state(out);
+}
+
+static esp_err_t set_output_brightness_locked(output_runtime_t *out, int brightness)
+{
+    if (!out || !out->enabled || out->type != OUTPUT_TYPE_WS2812) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    brightness = clamp_ws2812_brightness(brightness);
+    out->cfg.ws2812.level = brightness;
+    out->power = (brightness > 0);
     return output_apply_physical_state(out);
 }
 
@@ -1149,6 +1795,12 @@ static esp_err_t start_output_test_locked(output_runtime_t *out, int duration_ms
             case OUTPUT_TYPE_SERVO_5WIRE:
                 out->test_restore_level = out->cfg.servo_5wire.target_level;
                 break;
+            case OUTPUT_TYPE_STEPPER_28BYJ:
+                out->test_restore_level = out->cfg.stepper_28byj.target_level;
+                break;
+            case OUTPUT_TYPE_STEPPER_A4988:
+                out->test_restore_level = out->cfg.stepper_a4988.target_level;
+                break;
             default:
                 break;
         }
@@ -1167,7 +1819,7 @@ static esp_err_t start_output_test_locked(output_runtime_t *out, int duration_ms
             return output_apply_physical_state(out);
         case OUTPUT_TYPE_WS2812:
             out->cfg.ws2812.transition_active = false;
-            out->cfg.ws2812.level = 100;
+            out->cfg.ws2812.level = WS2812_BRIGHTNESS_MAX;
             out->cfg.ws2812.red = 255;
             out->cfg.ws2812.green = 255;
             out->cfg.ws2812.blue = 255;
@@ -1184,6 +1836,12 @@ static esp_err_t start_output_test_locked(output_runtime_t *out, int duration_ms
             out->cfg.servo_5wire.timed_out = false;
             (void)update_servo_5wire_control_locked(out, esp_timer_get_time());
             return ESP_OK;
+        case OUTPUT_TYPE_STEPPER_28BYJ:
+            test_level = out->cfg.stepper_28byj.current_level > 50 ? 0 : 100;
+            return set_output_level_locked(out, test_level);
+        case OUTPUT_TYPE_STEPPER_A4988:
+            test_level = out->cfg.stepper_a4988.current_level > 50 ? 0 : 100;
+            return set_output_level_locked(out, test_level);
         default:
             out->test_active = false;
             out->test_restore_at_us = 0;
@@ -1235,6 +1893,10 @@ static bool process_output_test_locked(output_runtime_t *out, int64_t now_us)
             (void)update_servo_5wire_control_locked(out, now_us);
             err = ESP_OK;
             break;
+        case OUTPUT_TYPE_STEPPER_28BYJ:
+        case OUTPUT_TYPE_STEPPER_A4988:
+            err = set_output_level_locked(out, out->test_restore_level);
+            break;
         default:
             err = ESP_ERR_NOT_SUPPORTED;
             break;
@@ -1271,6 +1933,33 @@ static void clear_runtime_locked(void)
         if (out->type == OUTPUT_TYPE_SERVO_5WIRE && out->cfg.servo_5wire.gpio_b >= 0) {
             (void)servo_5wire_set_drive_locked(out, 0);
             gpio_reset_pin((gpio_num_t)out->cfg.servo_5wire.gpio_b);
+        }
+        if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+            (void)stepper_28byj_release_locked(out);
+            if (out->cfg.stepper_28byj.gpio_b >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.stepper_28byj.gpio_b);
+            }
+            if (out->cfg.stepper_28byj.gpio_c >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.stepper_28byj.gpio_c);
+            }
+            if (out->cfg.stepper_28byj.gpio_d >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.stepper_28byj.gpio_d);
+            }
+            if (out->cfg.stepper_28byj.home_gpio >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.stepper_28byj.home_gpio);
+            }
+        }
+        if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+            (void)stepper_a4988_set_enable_locked(out, false);
+            if (out->cfg.stepper_a4988.gpio_b >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.stepper_a4988.gpio_b);
+            }
+            if (out->cfg.stepper_a4988.gpio_c >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.stepper_a4988.gpio_c);
+            }
+            if (out->cfg.stepper_a4988.home_gpio >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.stepper_a4988.home_gpio);
+            }
         }
         if (out->gpio >= 0) {
             gpio_reset_pin((gpio_num_t)out->gpio);
@@ -1501,6 +2190,178 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         return ESP_OK;
     }
 
+    if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+        out->cfg.stepper_28byj.gpio_b = jint(item, "gpio_b", -1);
+        out->cfg.stepper_28byj.gpio_c = jint(item, "gpio_c", -1);
+        out->cfg.stepper_28byj.gpio_d = jint(item, "gpio_d", -1);
+        out->cfg.stepper_28byj.home_gpio = jint(item, "home_gpio", -1);
+        out->cfg.stepper_28byj.home_pull_mode = pull_mode_from_text(jstr(item, "home_pull", "up"));
+        out->cfg.stepper_28byj.home_inverted = jbool(item, "home_inverted", false);
+        out->cfg.stepper_28byj.auto_home_on_boot = jbool(item, "auto_home_on_boot", false);
+        out->cfg.stepper_28byj.steps_range = jint(item, "steps_range", 2048);
+        out->cfg.stepper_28byj.speed_steps_per_sec = jint(item, "speed_steps_per_sec", 400);
+        out->cfg.stepper_28byj.reverse_direction = jbool(item, "reverse_direction", false);
+        out->cfg.stepper_28byj.hold_enabled = jbool(item, "hold_enabled", false);
+        out->cfg.stepper_28byj.target_level = jint(item, "default_level", 0);
+        if (out->cfg.stepper_28byj.steps_range < 32) {
+            out->cfg.stepper_28byj.steps_range = 32;
+        }
+        if (out->cfg.stepper_28byj.steps_range > 200000) {
+            out->cfg.stepper_28byj.steps_range = 200000;
+        }
+        if (out->cfg.stepper_28byj.speed_steps_per_sec < 10) {
+            out->cfg.stepper_28byj.speed_steps_per_sec = 10;
+        }
+        if (out->cfg.stepper_28byj.speed_steps_per_sec > 1500) {
+            out->cfg.stepper_28byj.speed_steps_per_sec = 1500;
+        }
+        if (out->cfg.stepper_28byj.target_level < 0) {
+            out->cfg.stepper_28byj.target_level = 0;
+        }
+        if (out->cfg.stepper_28byj.target_level > 100) {
+            out->cfg.stepper_28byj.target_level = 100;
+        }
+        if (out->cfg.stepper_28byj.gpio_b < 0 || out->cfg.stepper_28byj.gpio_c < 0 || out->cfg.stepper_28byj.gpio_d < 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->cfg.stepper_28byj.target_position_steps =
+            stepper_level_to_position(out->cfg.stepper_28byj.target_level, out->cfg.stepper_28byj.steps_range);
+        out->cfg.stepper_28byj.current_position_steps = out->cfg.stepper_28byj.target_position_steps;
+        out->cfg.stepper_28byj.current_level = out->cfg.stepper_28byj.target_level;
+        out->cfg.stepper_28byj.phase_index = out->cfg.stepper_28byj.current_position_steps % 8;
+        out->cfg.stepper_28byj.home_active = false;
+        out->cfg.stepper_28byj.homing = false;
+        out->cfg.stepper_28byj.homed = false;
+        out->cfg.stepper_28byj.moving = false;
+        out->cfg.stepper_28byj.last_step_us = 0;
+
+        gpio_config_t extra_io = {
+            .pin_bit_mask = (1ULL << out->cfg.stepper_28byj.gpio_b) |
+                            (1ULL << out->cfg.stepper_28byj.gpio_c) |
+                            (1ULL << out->cfg.stepper_28byj.gpio_d),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&extra_io));
+        if (out->cfg.stepper_28byj.home_gpio >= 0) {
+            gpio_config_t home_io = {
+                .pin_bit_mask = 1ULL << out->cfg.stepper_28byj.home_gpio,
+                .mode = GPIO_MODE_INPUT,
+                .pull_up_en = (out->cfg.stepper_28byj.home_pull_mode == GPIO_PULLUP_ONLY) ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
+                .pull_down_en = (out->cfg.stepper_28byj.home_pull_mode == GPIO_PULLDOWN_ONLY) ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
+                .intr_type = GPIO_INTR_DISABLE,
+            };
+            ESP_ERROR_CHECK(gpio_config(&home_io));
+            if (stepper_28byj_home_active_locked(out)) {
+                stepper_28byj_finish_home_locked(out);
+                return ESP_OK;
+            }
+            if (out->cfg.stepper_28byj.auto_home_on_boot) {
+                ESP_ERROR_CHECK(stepper_28byj_start_home_locked(out));
+                return ESP_OK;
+            }
+        }
+        if (out->cfg.stepper_28byj.hold_enabled) {
+            ESP_ERROR_CHECK(stepper_28byj_apply_phase_locked(out, out->cfg.stepper_28byj.phase_index));
+            out->power = true;
+        } else {
+            ESP_ERROR_CHECK(stepper_28byj_release_locked(out));
+            out->power = false;
+        }
+        return ESP_OK;
+    }
+
+    if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+        out->cfg.stepper_a4988.gpio_b = jint(item, "gpio_b", -1);
+        out->cfg.stepper_a4988.gpio_c = jint(item, "gpio_c", -1);
+        out->cfg.stepper_a4988.home_gpio = jint(item, "home_gpio", -1);
+        out->cfg.stepper_a4988.home_pull_mode = pull_mode_from_text(jstr(item, "home_pull", "up"));
+        out->cfg.stepper_a4988.home_inverted = jbool(item, "home_inverted", false);
+        out->cfg.stepper_a4988.auto_home_on_boot = jbool(item, "auto_home_on_boot", false);
+        out->cfg.stepper_a4988.enable_active_level = jint(item, "enable_active_level", 0) ? 1 : 0;
+        out->cfg.stepper_a4988.steps_range = jint(item, "steps_range", 200);
+        out->cfg.stepper_a4988.speed_steps_per_sec = jint(item, "speed_steps_per_sec", 800);
+        out->cfg.stepper_a4988.step_pulse_us = jint(item, "step_pulse_us", 4);
+        out->cfg.stepper_a4988.reverse_direction = jbool(item, "reverse_direction", false);
+        out->cfg.stepper_a4988.hold_enabled = jbool(item, "hold_enabled", false);
+        out->cfg.stepper_a4988.target_level = jint(item, "default_level", 0);
+        if (out->cfg.stepper_a4988.steps_range < 32) {
+            out->cfg.stepper_a4988.steps_range = 32;
+        }
+        if (out->cfg.stepper_a4988.steps_range > 200000) {
+            out->cfg.stepper_a4988.steps_range = 200000;
+        }
+        if (out->cfg.stepper_a4988.speed_steps_per_sec < 10) {
+            out->cfg.stepper_a4988.speed_steps_per_sec = 10;
+        }
+        if (out->cfg.stepper_a4988.speed_steps_per_sec > 20000) {
+            out->cfg.stepper_a4988.speed_steps_per_sec = 20000;
+        }
+        if (out->cfg.stepper_a4988.step_pulse_us < 2) {
+            out->cfg.stepper_a4988.step_pulse_us = 2;
+        }
+        if (out->cfg.stepper_a4988.step_pulse_us > 20) {
+            out->cfg.stepper_a4988.step_pulse_us = 20;
+        }
+        if (out->cfg.stepper_a4988.target_level < 0) {
+            out->cfg.stepper_a4988.target_level = 0;
+        }
+        if (out->cfg.stepper_a4988.target_level > 100) {
+            out->cfg.stepper_a4988.target_level = 100;
+        }
+        if (out->cfg.stepper_a4988.gpio_b < 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->cfg.stepper_a4988.target_position_steps =
+            stepper_level_to_position(out->cfg.stepper_a4988.target_level, out->cfg.stepper_a4988.steps_range);
+        out->cfg.stepper_a4988.current_position_steps = out->cfg.stepper_a4988.target_position_steps;
+        out->cfg.stepper_a4988.current_level = out->cfg.stepper_a4988.target_level;
+        out->cfg.stepper_a4988.home_active = false;
+        out->cfg.stepper_a4988.homing = false;
+        out->cfg.stepper_a4988.homed = false;
+        out->cfg.stepper_a4988.moving = false;
+        out->cfg.stepper_a4988.last_step_us = 0;
+
+        gpio_config_t extra_io = {
+            .pin_bit_mask = (1ULL << out->cfg.stepper_a4988.gpio_b) |
+                            ((out->cfg.stepper_a4988.gpio_c >= 0) ? (1ULL << out->cfg.stepper_a4988.gpio_c) : 0),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&extra_io));
+        ESP_ERROR_CHECK(gpio_set_level((gpio_num_t)out->gpio, 0));
+        if (out->cfg.stepper_a4988.home_gpio >= 0) {
+            gpio_config_t home_io = {
+                .pin_bit_mask = 1ULL << out->cfg.stepper_a4988.home_gpio,
+                .mode = GPIO_MODE_INPUT,
+                .pull_up_en = (out->cfg.stepper_a4988.home_pull_mode == GPIO_PULLUP_ONLY) ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
+                .pull_down_en = (out->cfg.stepper_a4988.home_pull_mode == GPIO_PULLDOWN_ONLY) ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
+                .intr_type = GPIO_INTR_DISABLE,
+            };
+            ESP_ERROR_CHECK(gpio_config(&home_io));
+            if (stepper_a4988_home_active_locked(out)) {
+                stepper_a4988_finish_home_locked(out);
+                return ESP_OK;
+            }
+            if (out->cfg.stepper_a4988.auto_home_on_boot) {
+                ESP_ERROR_CHECK(stepper_a4988_start_home_locked(out));
+                return ESP_OK;
+            }
+        }
+        if (out->cfg.stepper_a4988.hold_enabled) {
+            ESP_ERROR_CHECK(stepper_a4988_set_enable_locked(out, true));
+            out->power = true;
+        } else {
+            ESP_ERROR_CHECK(stepper_a4988_set_enable_locked(out, false));
+            out->power = false;
+        }
+        return ESP_OK;
+    }
+
     if (out->type == OUTPUT_TYPE_WS2812) {
         out->cfg.ws2812.pixel_count = jint(item, "pixel_count", 1);
         snprintf(out->cfg.ws2812.color_order, sizeof(out->cfg.ws2812.color_order), "%s",
@@ -1509,6 +2370,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             snprintf(out->cfg.ws2812.color_order, sizeof(out->cfg.ws2812.color_order), "%s", "GRB");
         }
         out->cfg.ws2812.default_power_on = jbool(item, "default_power_on", false);
+        out->cfg.ws2812.gamma_correction = jbool(item, "gamma_correction", false);
         out->cfg.ws2812.mode = ws2812_mode_from_text(jstr(item, "mode", "rgb"));
         out->cfg.ws2812.transition_style = ws2812_transition_style_from_text(jstr(item, "transition_style", "none"));
         out->cfg.ws2812.transition_ms = jint(item, "transition_ms", 300);
@@ -1518,7 +2380,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         if (out->cfg.ws2812.transition_ms > 5000) {
             out->cfg.ws2812.transition_ms = 5000;
         }
-        out->cfg.ws2812.level = out->cfg.ws2812.default_power_on ? 100 : 0;
+        out->cfg.ws2812.level = out->cfg.ws2812.default_power_on ? WS2812_BRIGHTNESS_MAX : 0;
         out->cfg.ws2812.red = 255;
         out->cfg.ws2812.green = 255;
         out->cfg.ws2812.blue = 255;
@@ -1820,11 +2682,15 @@ static esp_err_t execute_button_action_locked(const button_action_t *action)
             if (out->type == OUTPUT_TYPE_PWM) {
                 level = out->cfg.pwm.level;
             } else if (out->type == OUTPUT_TYPE_WS2812) {
-                level = out->cfg.ws2812.level;
+                level = ws2812_percent_from_brightness(out->cfg.ws2812.level);
             } else if (out->type == OUTPUT_TYPE_SERVO_3WIRE) {
                 level = out->cfg.servo_3wire.level;
             } else if (out->type == OUTPUT_TYPE_SERVO_5WIRE) {
                 level = out->cfg.servo_5wire.target_level;
+            } else if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+                level = out->cfg.stepper_28byj.target_level;
+            } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+                level = out->cfg.stepper_a4988.target_level;
             }
             level += (action->type == ACTION_DIM_STEP_UP) ? action->step : -action->step;
             return set_output_level_locked(out, level);
@@ -1922,6 +2788,21 @@ static void modules_poll_task(void *arg)
             }
             if (update_servo_5wire_control_locked(out, now_us)) {
                 changed = true;
+            }
+        }
+        for (int i = 0; i < s_runtime.output_count; ++i) {
+            output_runtime_t *out = &s_runtime.outputs[i];
+            if (!out->used || !out->enabled) {
+                continue;
+            }
+            if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+                if (update_stepper_28byj_control_locked(out, now_us)) {
+                    changed = true;
+                }
+            } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+                if (update_stepper_a4988_control_locked(out, now_us)) {
+                    changed = true;
+                }
             }
         }
         for (int i = 0; i < s_runtime.input_count; ++i) {
@@ -2078,10 +2959,12 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
             cJSON_AddBoolToObject(obj, "power_relay_on", out->power && out->cfg.pwm.level > 0);
         }
     } else if (out->type == OUTPUT_TYPE_WS2812) {
-        cJSON_AddNumberToObject(obj, "level", out->cfg.ws2812.level);
+        cJSON_AddNumberToObject(obj, "level", ws2812_percent_from_brightness(out->cfg.ws2812.level));
+        cJSON_AddNumberToObject(obj, "brightness", out->cfg.ws2812.level);
         cJSON_AddNumberToObject(obj, "pixel_count", out->cfg.ws2812.pixel_count);
         cJSON_AddStringToObject(obj, "mode", ws2812_mode_to_text(out->cfg.ws2812.mode));
         cJSON_AddStringToObject(obj, "color_order", out->cfg.ws2812.color_order);
+        cJSON_AddBoolToObject(obj, "gamma_correction", out->cfg.ws2812.gamma_correction);
         cJSON_AddStringToObject(obj, "transition_style", ws2812_transition_style_to_text(out->cfg.ws2812.transition_style));
         cJSON_AddNumberToObject(obj, "transition_ms", out->cfg.ws2812.transition_ms);
         if (out->cfg.ws2812.mode == WS2812_MODE_RGB) {
@@ -2107,6 +2990,53 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
         cJSON_AddBoolToObject(obj, "reverse_direction", out->cfg.servo_5wire.reverse_direction);
         cJSON_AddBoolToObject(obj, "moving", out->cfg.servo_5wire.moving);
         cJSON_AddBoolToObject(obj, "timed_out", out->cfg.servo_5wire.timed_out);
+    } else if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+        cJSON_AddNumberToObject(obj, "level", out->cfg.stepper_28byj.current_level);
+        cJSON_AddNumberToObject(obj, "target_level", out->cfg.stepper_28byj.target_level);
+        cJSON_AddNumberToObject(obj, "gpio_b", out->cfg.stepper_28byj.gpio_b);
+        cJSON_AddNumberToObject(obj, "gpio_c", out->cfg.stepper_28byj.gpio_c);
+        cJSON_AddNumberToObject(obj, "gpio_d", out->cfg.stepper_28byj.gpio_d);
+        if (out->cfg.stepper_28byj.home_gpio >= 0) {
+            cJSON_AddNumberToObject(obj, "home_gpio", out->cfg.stepper_28byj.home_gpio);
+            cJSON_AddStringToObject(obj, "home_pull", pull_mode_to_text(out->cfg.stepper_28byj.home_pull_mode));
+        }
+        cJSON_AddNumberToObject(obj, "steps_range", out->cfg.stepper_28byj.steps_range);
+        cJSON_AddNumberToObject(obj, "speed_steps_per_sec", out->cfg.stepper_28byj.speed_steps_per_sec);
+        cJSON_AddNumberToObject(obj, "position_steps", out->cfg.stepper_28byj.current_position_steps);
+        cJSON_AddNumberToObject(obj, "target_position_steps", out->cfg.stepper_28byj.target_position_steps);
+        cJSON_AddBoolToObject(obj, "reverse_direction", out->cfg.stepper_28byj.reverse_direction);
+        cJSON_AddBoolToObject(obj, "hold_enabled", out->cfg.stepper_28byj.hold_enabled);
+        cJSON_AddBoolToObject(obj, "home_inverted", out->cfg.stepper_28byj.home_inverted);
+        cJSON_AddBoolToObject(obj, "auto_home_on_boot", out->cfg.stepper_28byj.auto_home_on_boot);
+        cJSON_AddBoolToObject(obj, "home_active", out->cfg.stepper_28byj.home_active);
+        cJSON_AddBoolToObject(obj, "homing", out->cfg.stepper_28byj.homing);
+        cJSON_AddBoolToObject(obj, "homed", out->cfg.stepper_28byj.homed);
+        cJSON_AddBoolToObject(obj, "moving", out->cfg.stepper_28byj.moving);
+    } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+        cJSON_AddNumberToObject(obj, "level", out->cfg.stepper_a4988.current_level);
+        cJSON_AddNumberToObject(obj, "target_level", out->cfg.stepper_a4988.target_level);
+        cJSON_AddNumberToObject(obj, "gpio_b", out->cfg.stepper_a4988.gpio_b);
+        if (out->cfg.stepper_a4988.gpio_c >= 0) {
+            cJSON_AddNumberToObject(obj, "gpio_c", out->cfg.stepper_a4988.gpio_c);
+            cJSON_AddNumberToObject(obj, "enable_active_level", out->cfg.stepper_a4988.enable_active_level);
+        }
+        if (out->cfg.stepper_a4988.home_gpio >= 0) {
+            cJSON_AddNumberToObject(obj, "home_gpio", out->cfg.stepper_a4988.home_gpio);
+            cJSON_AddStringToObject(obj, "home_pull", pull_mode_to_text(out->cfg.stepper_a4988.home_pull_mode));
+        }
+        cJSON_AddNumberToObject(obj, "steps_range", out->cfg.stepper_a4988.steps_range);
+        cJSON_AddNumberToObject(obj, "speed_steps_per_sec", out->cfg.stepper_a4988.speed_steps_per_sec);
+        cJSON_AddNumberToObject(obj, "step_pulse_us", out->cfg.stepper_a4988.step_pulse_us);
+        cJSON_AddNumberToObject(obj, "position_steps", out->cfg.stepper_a4988.current_position_steps);
+        cJSON_AddNumberToObject(obj, "target_position_steps", out->cfg.stepper_a4988.target_position_steps);
+        cJSON_AddBoolToObject(obj, "reverse_direction", out->cfg.stepper_a4988.reverse_direction);
+        cJSON_AddBoolToObject(obj, "hold_enabled", out->cfg.stepper_a4988.hold_enabled);
+        cJSON_AddBoolToObject(obj, "home_inverted", out->cfg.stepper_a4988.home_inverted);
+        cJSON_AddBoolToObject(obj, "auto_home_on_boot", out->cfg.stepper_a4988.auto_home_on_boot);
+        cJSON_AddBoolToObject(obj, "home_active", out->cfg.stepper_a4988.home_active);
+        cJSON_AddBoolToObject(obj, "homing", out->cfg.stepper_a4988.homing);
+        cJSON_AddBoolToObject(obj, "homed", out->cfg.stepper_a4988.homed);
+        cJSON_AddBoolToObject(obj, "moving", out->cfg.stepper_a4988.moving);
     }
     return obj;
 }
@@ -2335,24 +3265,45 @@ esp_err_t modules_action(const char *id, const cJSON *action, cJSON **out_respon
         if (out) {
             if (jbool(action, "test", false)) {
                 err = start_output_test_locked(out, jint(action, "duration_ms", 1200));
+            } else if (jbool(action, "home", false)) {
+                if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+                    err = stepper_28byj_start_home_locked(out);
+                } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+                    err = stepper_a4988_start_home_locked(out);
+                } else {
+                    err = ESP_ERR_NOT_SUPPORTED;
+                }
             } else if (jbool(action, "toggle", false)) {
                 err = set_output_power_locked(out, !out->power);
             } else {
                 const cJSON *set = jobj(action, "set");
                 const cJSON *set_level = jobj(action, "set_level");
+                const cJSON *set_brightness = jobj(action, "set_brightness");
                 const cJSON *color = jobj(action, "color");
+                bool handled = false;
+
                 if (cJSON_IsBool(set)) {
                     err = set_output_power_locked(out, cJSON_IsTrue(set));
-                } else if (cJSON_IsNumber(set_level)) {
+                    handled = true;
+                }
+                if (err == ESP_OK && cJSON_IsNumber(set_level)) {
                     err = set_output_level_locked(out, set_level->valueint);
-                } else if (out->type == OUTPUT_TYPE_WS2812 && cJSON_IsObject((cJSON *)color)) {
+                    handled = true;
+                }
+                if (err == ESP_OK && out->type == OUTPUT_TYPE_WS2812 && cJSON_IsNumber(set_brightness)) {
+                    err = set_output_brightness_locked(out, set_brightness->valueint);
+                    handled = true;
+                }
+                if (err == ESP_OK && out->type == OUTPUT_TYPE_WS2812 && cJSON_IsObject((cJSON *)color)) {
                     if (out->cfg.ws2812.mode == WS2812_MODE_RGB) {
                         out->cfg.ws2812.red = (uint8_t)jint(color, "r", out->cfg.ws2812.red);
                         out->cfg.ws2812.green = (uint8_t)jint(color, "g", out->cfg.ws2812.green);
                         out->cfg.ws2812.blue = (uint8_t)jint(color, "b", out->cfg.ws2812.blue);
                     }
                     err = output_apply_physical_state(out);
-                } else {
+                    handled = true;
+                }
+                if (!handled) {
                     err = ESP_ERR_INVALID_ARG;
                 }
             }

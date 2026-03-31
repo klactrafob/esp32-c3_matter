@@ -29,6 +29,7 @@ idf_component_register(
     esp_netif
     esp_timer
     esp_http_server
+    app_update
     freertos
     driver
     lwip

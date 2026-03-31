@@ -5,8 +5,10 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -22,6 +24,7 @@
 
 static const char *TAG = "web";
 static httpd_handle_t s_server = NULL;
+static const size_t OTA_RECV_CHUNK = 4096;
 
 typedef struct {
     cJSON *cfg_dup;
@@ -148,6 +151,13 @@ static void factory_reset_task(void *arg)
     esp_restart();
 }
 
+static void ota_restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
 static esp_err_t handle_root(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -248,6 +258,90 @@ static esp_err_t handle_factory_reset(httpd_req_t *req)
     return r;
 }
 
+static esp_err_t handle_ota_upload(httpd_req_t *req)
+{
+    if (req->content_len <= 0) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty firmware body");
+    }
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (!update_partition) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
+    }
+
+    if ((size_t)req->content_len > update_partition->size) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "firmware too large");
+    }
+
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t err = esp_ota_begin(update_partition, (size_t)req->content_len, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota begin failed");
+    }
+
+    char *buf = malloc(OTA_RECV_CHUNK);
+    if (!buf) {
+        (void)esp_ota_abort(ota_handle);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    }
+
+    int remaining = req->content_len;
+
+    while (remaining > 0) {
+        const int want = remaining > (int)OTA_RECV_CHUNK ? (int)OTA_RECV_CHUNK : remaining;
+        int received = httpd_req_recv(req, buf, want);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (received <= 0) {
+            free(buf);
+            (void)esp_ota_abort(ota_handle);
+            ESP_LOGE(TAG, "ota recv failed after %d bytes", req->content_len - remaining);
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota receive failed");
+        }
+
+        err = esp_ota_write(ota_handle, buf, (size_t)received);
+        if (err != ESP_OK) {
+            free(buf);
+            (void)esp_ota_abort(ota_handle);
+            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota write failed");
+        }
+
+        remaining -= received;
+    }
+
+    free(buf);
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        (void)esp_ota_abort(ota_handle);
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid firmware image");
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota activate failed");
+    }
+
+    if (xTaskCreate(ota_restart_task, "ota_restart", 3072, NULL, 4, NULL) != pdPASS) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "restart task failed");
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    }
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "note", "firmware uploaded, reboot scheduled");
+    err = json_send(req, resp, 200);
+    cJSON_Delete(resp);
+    return err;
+}
+
 static esp_err_t handle_get_modules(httpd_req_t *req)
 {
     cJSON *st = modules_build_status_json();
@@ -266,11 +360,15 @@ static esp_err_t handle_get_runtime(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
     }
 
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+
     cJSON_AddStringToObject(rt, "mode", wifi_mgr_is_ap() ? "ap" : "sta");
     cJSON_AddStringToObject(rt, "ap_ssid", wifi_mgr_is_ap() ? wifi_mgr_get_ap_ssid() : "");
     cJSON_AddBoolToObject(rt, "mqtt_connected", mqtt_mgr_is_connected());
     cJSON_AddBoolToObject(rt, "sta_configured", wifi_mgr_sta_configured());
     cJSON_AddBoolToObject(rt, "sta_has_ip", wifi_mgr_sta_has_ip());
+    cJSON_AddStringToObject(rt, "fw_build_date", app_desc ? app_desc->date : "");
+    cJSON_AddStringToObject(rt, "fw_build_time", app_desc ? app_desc->time : "");
 
     esp_err_t r = json_send(req, rt, 200);
     cJSON_Delete(rt);
@@ -386,6 +484,7 @@ esp_err_t web_server_start(void)
     httpd_uri_t post_cfg = {.uri = "/api/config", .method = HTTP_POST, .handler = handle_post_config};
     httpd_uri_t apply = {.uri = "/api/apply", .method = HTTP_POST, .handler = handle_apply};
     httpd_uri_t factory_reset = {.uri = "/api/factory-reset", .method = HTTP_POST, .handler = handle_factory_reset};
+    httpd_uri_t ota = {.uri = "/api/ota", .method = HTTP_POST, .handler = handle_ota_upload};
     httpd_uri_t mods = {.uri = "/api/modules", .method = HTTP_GET, .handler = handle_get_modules};
     httpd_uri_t runtime = {.uri = "/api/runtime", .method = HTTP_GET, .handler = handle_get_runtime};
     httpd_uri_t wifi_scan = {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = handle_wifi_scan};
@@ -401,6 +500,7 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(s_server, &post_cfg);
     httpd_register_uri_handler(s_server, &apply);
     httpd_register_uri_handler(s_server, &factory_reset);
+    httpd_register_uri_handler(s_server, &ota);
     httpd_register_uri_handler(s_server, &mods);
     httpd_register_uri_handler(s_server, &runtime);
     httpd_register_uri_handler(s_server, &wifi_scan);

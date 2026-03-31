@@ -246,7 +246,8 @@ static void build_entities_from_status(const cJSON *status)
             const char *component = "light";
             if (strcmp(type, "relay") == 0) {
                 component = "switch";
-            } else if (strcmp(type, "servo_3wire") == 0 || strcmp(type, "servo_5wire") == 0) {
+            } else if (strcmp(type, "servo_3wire") == 0 || strcmp(type, "servo_5wire") == 0 ||
+                       strcmp(type, "stepper_28byj") == 0 || strcmp(type, "stepper_a4988") == 0) {
                 component = "number";
             }
             add_entity(ENTITY_KIND_OUTPUT, component, jstr(item, "id", ""),
@@ -353,7 +354,8 @@ static esp_err_t publish_discovery_entity(const mqtt_entity_t *entity)
         cJSON_AddStringToObject(root, "payload_off", "OFF");
         cJSON_AddBoolToObject(root, "retain", s_cfg.retain);
     } else if (entity->kind == ENTITY_KIND_OUTPUT &&
-               (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0)) {
+               (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0 ||
+                strcmp(entity->type, "stepper_28byj") == 0 || strcmp(entity->type, "stepper_a4988") == 0)) {
         cJSON_AddStringToObject(root, "command_topic", entity->command_topic);
         cJSON_AddStringToObject(root, "state_topic", entity->state_topic);
         cJSON_AddNumberToObject(root, "min", 0);
@@ -467,7 +469,8 @@ static esp_err_t publish_entity_state_from_status(const mqtt_entity_t *entity, c
         bool power = jbool(status, "power", false);
         snprintf(payload, sizeof(payload), "%s", power ? "ON" : "OFF");
     } else if (entity->kind == ENTITY_KIND_OUTPUT &&
-               (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0)) {
+               (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0 ||
+                strcmp(entity->type, "stepper_28byj") == 0 || strcmp(entity->type, "stepper_a4988") == 0)) {
         int level = jint(status, "level", 0);
         snprintf(payload, sizeof(payload), "%d", level);
     } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "pwm") == 0) {
@@ -478,8 +481,7 @@ static esp_err_t publish_entity_state_from_status(const mqtt_entity_t *entity, c
                  power ? "ON" : "OFF", brightness);
     } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "ws2812") == 0) {
         bool power = jbool(status, "power", false);
-        int level = jint(status, "level", 0);
-        int brightness = (level * 255) / 100;
+        int brightness = jint(status, "brightness", 0);
         if (strcmp(entity->output_mode, "mono_triplet") == 0) {
             snprintf(payload, sizeof(payload), "{\"state\":\"%s\",\"brightness\":%d}",
                      power ? "ON" : "OFF", brightness);
@@ -570,9 +572,13 @@ static esp_err_t apply_light_command(const mqtt_entity_t *entity, const char *da
 
         const cJSON *brightness = cJSON_GetObjectItemCaseSensitive(root, "brightness");
         if (cJSON_IsNumber(brightness)) {
-            int level = (brightness->valueint * 100) / 255;
             cJSON_DeleteItemFromObjectCaseSensitive(action, "set");
-            cJSON_AddNumberToObject(action, "set_level", level);
+            if (strcmp(entity->type, "ws2812") == 0) {
+                cJSON_AddNumberToObject(action, "set_brightness", brightness->valueint);
+            } else {
+                int level = (brightness->valueint * 100) / 255;
+                cJSON_AddNumberToObject(action, "set_level", level);
+            }
         }
 
         const cJSON *color = cJSON_GetObjectItemCaseSensitive(root, "color");
