@@ -16,6 +16,7 @@
 
 #include "net/dns_server.h"
 #include "app_config.h"
+#include "core/system_log.h"
 
 static const char *TAG = "wifi";
 
@@ -26,6 +27,7 @@ static bool s_is_ap = false;
 static bool s_sta_configured = false;
 static bool s_ap_always_on = false;
 static volatile bool s_sta_has_ip = false;
+static volatile int s_sta_rssi = 0;
 static volatile int64_t s_sta_last_try_us = 0;
 static TaskHandle_t s_wifi_mon_task = NULL;
 static bool s_wifi_handlers_registered = false;
@@ -49,6 +51,7 @@ bool wifi_mgr_is_ap(void) { return s_is_ap; }
 const char *wifi_mgr_get_ap_ssid(void) { return s_ap_ssid; }
 bool wifi_mgr_sta_configured(void) { return s_sta_configured; }
 bool wifi_mgr_sta_has_ip(void) { return s_sta_has_ip; }
+int wifi_mgr_get_sta_rssi(void) { return s_sta_rssi; }
 
 static void replace_scan_cache(const cJSON *arr)
 {
@@ -506,7 +509,12 @@ static void wifi_monitor_task(void *arg)
 
         if (s_sta_has_ip) {
             s_is_ap = false;
+            wifi_ap_record_t ap_info = {0};
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                s_sta_rssi = ap_info.rssi;
+            }
         } else {
+            s_sta_rssi = 0;
             if ((now_us - s_sta_last_try_us) >= retry_us) {
                 s_sta_last_try_us = now_us;
                 esp_err_t err = esp_wifi_connect();
@@ -535,8 +543,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_START) {
         ensure_ap_dhcp_server_started();
         ESP_LOGI(TAG, "AP interface started");
+        system_log_writef("wifi", "info", "AP started: %s", s_ap_ssid);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STOP) {
         ESP_LOGW(TAG, "AP interface stopped");
+        system_log_write("wifi", "warn", "AP interface stopped");
         if (s_ap_always_on) {
             s_ap_restore_pending = true;
         }
@@ -548,14 +558,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             s_sta_last_try_us = esp_timer_get_time();
             ESP_LOGW(TAG, "STA disconnected (reason=%d), next retry in %d sec",
                      ev ? ev->reason : -1, STA_RETRY_PERIOD_MS / 1000);
+            system_log_writef("wifi", "warn", "STA disconnected, reason=%d",
+                              ev ? ev->reason : -1);
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t*)data;
         s_sta_has_ip = true;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        system_log_writef("wifi", "info", "STA got IP " IPSTR, IP2STR(&e->ip_info.ip));
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
         s_sta_has_ip = false;
         ESP_LOGW(TAG, "STA lost IP");
+        system_log_write("wifi", "warn", "STA lost IP");
     }
 }
 

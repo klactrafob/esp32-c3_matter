@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,6 +18,7 @@
 #include "app_config.h"
 #include "core/cfg_json.h"
 #include "core/modules.h"
+#include "core/system_log.h"
 #include "net/dns_server.h"
 #include "net/mqtt_mgr.h"
 #include "net/web_ui.h"
@@ -30,6 +32,34 @@ typedef struct {
     cJSON *cfg_dup;
 } apply_ctx_t;
 
+static void apply_cfg_task(void *arg);
+
+static const cJSON *jobj(const cJSON *obj, const char *key)
+{
+    if (!cJSON_IsObject((cJSON *)obj)) {
+        return NULL;
+    }
+    return cJSON_GetObjectItemCaseSensitive((cJSON *)obj, key);
+}
+
+static const char *jstr(const cJSON *obj, const char *key, const char *def)
+{
+    const cJSON *item = jobj(obj, key);
+    if (cJSON_IsString(item) && item->valuestring) {
+        return item->valuestring;
+    }
+    return def;
+}
+
+static bool jbool(const cJSON *obj, const char *key, bool def)
+{
+    const cJSON *item = jobj(obj, key);
+    if (cJSON_IsBool(item)) {
+        return cJSON_IsTrue(item);
+    }
+    return def;
+}
+
 static bool captive_active(void)
 {
 #if APP_CAPTIVE_PORTAL_ENABLE
@@ -37,6 +67,85 @@ static bool captive_active(void)
 #else
     return false;
 #endif
+}
+
+static const cJSON *get_web_auth_cfg(void)
+{
+    const cJSON *web = jobj(cfg_json_get(), "web");
+    return jobj(web, "auth");
+}
+
+static bool is_auth_enabled(void)
+{
+    const cJSON *auth = get_web_auth_cfg();
+    const char *password = jstr(auth, "password", "");
+    return jbool(auth, "enable", false) && password[0] != 0;
+}
+
+static esp_err_t require_auth(httpd_req_t *req)
+{
+    char provided[96] = {0};
+    const cJSON *auth = get_web_auth_cfg();
+    const char *expected = jstr(auth, "password", "");
+
+    if (!is_auth_enabled()) {
+        return ESP_OK;
+    }
+
+    size_t len = httpd_req_get_hdr_value_len(req, "X-Auth-Token");
+    if (len == 0 || len >= sizeof(provided)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        return httpd_resp_send(req, "auth required", HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", provided, sizeof(provided)) != ESP_OK ||
+        strcmp(provided, expected) != 0) {
+        system_log_write("web", "warn", "Rejected API request with invalid auth token");
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        return httpd_resp_send(req, "auth required", HTTPD_RESP_USE_STRLEN);
+    }
+
+    return ESP_OK;
+}
+
+static const char *reset_reason_text(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "int_wdt";
+        case ESP_RST_TASK_WDT: return "task_wdt";
+        case ESP_RST_WDT: return "other_wdt";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "sdio";
+        default: return "unknown";
+    }
+}
+
+static esp_err_t schedule_apply_from_current_cfg(void)
+{
+    apply_ctx_t *ctx = calloc(1, sizeof(apply_ctx_t));
+    if (!ctx) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ctx->cfg_dup = cJSON_Duplicate((cJSON *)cfg_json_get(), 1);
+    if (!ctx->cfg_dup) {
+        free(ctx);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskCreate(apply_cfg_task, "apply_cfg", 4096, ctx, 4, NULL) != pdPASS) {
+        cJSON_Delete(ctx->cfg_dup);
+        free(ctx);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 static esp_err_t json_send(httpd_req_t *req, cJSON *obj, int status_code)
@@ -166,6 +275,11 @@ static esp_err_t handle_root(httpd_req_t *req)
 
 static esp_err_t handle_get_config(httpd_req_t *req)
 {
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
     const cJSON *cfg = cfg_json_get();
     cJSON *dup = cJSON_Duplicate((cJSON *)cfg, 1);
     if (!dup) {
@@ -178,6 +292,11 @@ static esp_err_t handle_get_config(httpd_req_t *req)
 
 static esp_err_t handle_post_config(httpd_req_t *req)
 {
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
     cJSON *root = NULL;
     esp_err_t err = read_body_json(req, &root);
     if (err != ESP_OK) {
@@ -189,6 +308,7 @@ static esp_err_t handle_post_config(httpd_req_t *req)
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, cfg_json_last_error());
     }
+    system_log_write("web", "info", "Configuration saved");
 
     cJSON *ok = cJSON_CreateObject();
     cJSON_AddBoolToObject(ok, "ok", true);
@@ -200,27 +320,20 @@ static esp_err_t handle_post_config(httpd_req_t *req)
 
 static esp_err_t handle_apply(httpd_req_t *req)
 {
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
     esp_err_t err = modules_apply_config(cfg_json_get());
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply failed");
     }
-
-    apply_ctx_t *ctx = calloc(1, sizeof(apply_ctx_t));
-    if (!ctx) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-    }
-
-    ctx->cfg_dup = cJSON_Duplicate((cJSON *)cfg_json_get(), 1);
-    if (!ctx->cfg_dup) {
-        free(ctx);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-    }
-
-    if (xTaskCreate(apply_cfg_task, "apply_cfg", 4096, ctx, 4, NULL) != pdPASS) {
-        cJSON_Delete(ctx->cfg_dup);
-        free(ctx);
+    err = schedule_apply_from_current_cfg();
+    if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply task failed");
     }
+    system_log_write("web", "info", "Runtime apply scheduled");
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
@@ -232,6 +345,11 @@ static esp_err_t handle_apply(httpd_req_t *req)
 
 static esp_err_t handle_factory_reset(httpd_req_t *req)
 {
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
     cJSON *root = NULL;
     esp_err_t err = read_body_json(req, &root);
     if (err != ESP_OK) {
@@ -249,6 +367,7 @@ static esp_err_t handle_factory_reset(httpd_req_t *req)
     if (xTaskCreate(factory_reset_task, "factory_reset", 4096, NULL, 4, NULL) != pdPASS) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "reset task failed");
     }
+    system_log_write("web", "warn", "Factory reset scheduled");
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
@@ -260,6 +379,11 @@ static esp_err_t handle_factory_reset(httpd_req_t *req)
 
 static esp_err_t handle_ota_upload(httpd_req_t *req)
 {
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
     if (req->content_len <= 0) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty firmware body");
     }
@@ -326,6 +450,7 @@ static esp_err_t handle_ota_upload(httpd_req_t *req)
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota activate failed");
     }
+    system_log_writef("web", "info", "OTA uploaded (%d bytes)", req->content_len);
 
     if (xTaskCreate(ota_restart_task, "ota_restart", 3072, NULL, 4, NULL) != pdPASS) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "restart task failed");
@@ -344,6 +469,11 @@ static esp_err_t handle_ota_upload(httpd_req_t *req)
 
 static esp_err_t handle_get_modules(httpd_req_t *req)
 {
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
     cJSON *st = modules_build_status_json();
     if (!st) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
@@ -367,6 +497,7 @@ static esp_err_t handle_get_runtime(httpd_req_t *req)
     cJSON_AddBoolToObject(rt, "mqtt_connected", mqtt_mgr_is_connected());
     cJSON_AddBoolToObject(rt, "sta_configured", wifi_mgr_sta_configured());
     cJSON_AddBoolToObject(rt, "sta_has_ip", wifi_mgr_sta_has_ip());
+    cJSON_AddBoolToObject(rt, "auth_required", is_auth_enabled());
     cJSON_AddStringToObject(rt, "fw_build_date", app_desc ? app_desc->date : "");
     cJSON_AddStringToObject(rt, "fw_build_time", app_desc ? app_desc->time : "");
 
@@ -377,6 +508,11 @@ static esp_err_t handle_get_runtime(httpd_req_t *req)
 
 static esp_err_t handle_wifi_scan(httpd_req_t *req)
 {
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
     cJSON *networks = NULL;
     bool cached = false;
 
@@ -410,8 +546,127 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
     return r;
 }
 
+static esp_err_t handle_get_backup(httpd_req_t *req)
+{
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
+    cJSON *dup = cJSON_Duplicate((cJSON *)cfg_json_get(), 1);
+    char *payload;
+    if (!dup) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    }
+
+    payload = cJSON_PrintUnformatted(dup);
+    cJSON_Delete(dup);
+    if (!payload) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"esp32-config-backup.json\"");
+    esp_err_t err = httpd_resp_send(req, payload, HTTPD_RESP_USE_STRLEN);
+    free(payload);
+    return err;
+}
+
+static esp_err_t handle_post_restore(httpd_req_t *req)
+{
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
+    cJSON *root = NULL;
+    esp_err_t err = read_body_json(req, &root);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+    }
+
+    err = cfg_json_set_and_save(root);
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, cfg_json_last_error());
+    }
+
+    err = modules_apply_config(cfg_json_get());
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply failed");
+    }
+    err = schedule_apply_from_current_cfg();
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply task failed");
+    }
+    system_log_write("web", "info", "Configuration restored from backup");
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "note", "backup restored and apply scheduled");
+    err = json_send(req, resp, 200);
+    cJSON_Delete(resp);
+    return err;
+}
+
+static esp_err_t handle_get_system(httpd_req_t *req)
+{
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (!root) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    }
+
+    cJSON_AddNumberToObject(root, "uptime_ms", (double)(esp_timer_get_time() / 1000LL));
+    cJSON_AddNumberToObject(root, "free_heap", esp_get_free_heap_size());
+    cJSON_AddNumberToObject(root, "min_free_heap", esp_get_minimum_free_heap_size());
+    cJSON_AddStringToObject(root, "reset_reason", reset_reason_text(esp_reset_reason()));
+    cJSON_AddBoolToObject(root, "mqtt_connected", mqtt_mgr_is_connected());
+    cJSON_AddBoolToObject(root, "sta_has_ip", wifi_mgr_sta_has_ip());
+    cJSON_AddBoolToObject(root, "sta_configured", wifi_mgr_sta_configured());
+    cJSON_AddBoolToObject(root, "auth_enabled", is_auth_enabled());
+    cJSON_AddStringToObject(root, "mode", wifi_mgr_is_ap() ? "ap" : "sta");
+    cJSON_AddStringToObject(root, "ap_ssid", wifi_mgr_get_ap_ssid());
+    cJSON_AddNumberToObject(root, "sta_rssi", wifi_mgr_get_sta_rssi());
+    cJSON_AddStringToObject(root, "fw_build_date", app_desc ? app_desc->date : "");
+    cJSON_AddStringToObject(root, "fw_build_time", app_desc ? app_desc->time : "");
+    esp_err_t err = json_send(req, root, 200);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t handle_get_events(httpd_req_t *req)
+{
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *events = system_log_build_json(32);
+    if (!root || !events) {
+        cJSON_Delete(root);
+        cJSON_Delete(events);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    }
+    cJSON_AddItemToObject(root, "events", events);
+    esp_err_t err = json_send(req, root, 200);
+    cJSON_Delete(root);
+    return err;
+}
+
 static esp_err_t handle_module_action(httpd_req_t *req)
 {
+    esp_err_t auth_err = require_auth(req);
+    if (auth_err != ESP_OK) {
+        return auth_err;
+    }
+
     static const char *prefix = "/api/modules/";
     const char *uri = req->uri;
     size_t prefix_len = strlen(prefix);
@@ -488,6 +743,10 @@ esp_err_t web_server_start(void)
     httpd_uri_t mods = {.uri = "/api/modules", .method = HTTP_GET, .handler = handle_get_modules};
     httpd_uri_t runtime = {.uri = "/api/runtime", .method = HTTP_GET, .handler = handle_get_runtime};
     httpd_uri_t wifi_scan = {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = handle_wifi_scan};
+    httpd_uri_t backup = {.uri = "/api/backup", .method = HTTP_GET, .handler = handle_get_backup};
+    httpd_uri_t restore = {.uri = "/api/restore", .method = HTTP_POST, .handler = handle_post_restore};
+    httpd_uri_t system = {.uri = "/api/system", .method = HTTP_GET, .handler = handle_get_system};
+    httpd_uri_t events = {.uri = "/api/events", .method = HTTP_GET, .handler = handle_get_events};
     httpd_uri_t act = {.uri = "/api/modules/*", .method = HTTP_POST, .handler = handle_module_action};
     httpd_uri_t u204 = {.uri = "/generate_204", .method = HTTP_GET, .handler = handle_generate_204};
     httpd_uri_t uios = {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect_to_root};
@@ -504,6 +763,10 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(s_server, &mods);
     httpd_register_uri_handler(s_server, &runtime);
     httpd_register_uri_handler(s_server, &wifi_scan);
+    httpd_register_uri_handler(s_server, &backup);
+    httpd_register_uri_handler(s_server, &restore);
+    httpd_register_uri_handler(s_server, &system);
+    httpd_register_uri_handler(s_server, &events);
     httpd_register_uri_handler(s_server, &act);
     httpd_register_uri_handler(s_server, &u204);
     httpd_register_uri_handler(s_server, &uios);

@@ -6,6 +6,7 @@ idf_component_register(
 
     "core/cfg_json.c"
     "core/modules.c"
+    "core/system_log.c"
 
     "net/wifi_mgr.c"
     "net/dns_server.c"

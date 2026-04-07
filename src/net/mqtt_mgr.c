@@ -13,6 +13,7 @@
 #include "mqtt_client.h"
 
 #include "core/modules.h"
+#include "core/system_log.h"
 
 static const char *TAG = "mqtt_mgr";
 
@@ -58,6 +59,7 @@ typedef struct {
     char metric[24];
     char unique_id[64];
     char command_topic[160];
+    char set_position_topic[160];
     char state_topic[160];
     char config_topic[192];
     bool has_last_published_payload;
@@ -89,6 +91,10 @@ static int entity_publish_throttle_ms(const mqtt_entity_t *entity);
 static esp_err_t flush_pending_entity_updates(void);
 static esp_err_t ensure_flush_task(void);
 static esp_err_t apply_number_command(const mqtt_entity_t *entity, const char *data, int len);
+static bool topic_matches(const char *expected, const char *topic, int topic_len);
+static bool entity_uses_position_topic(const mqtt_entity_t *entity, const char *topic, int topic_len);
+static esp_err_t apply_cover_command(const mqtt_entity_t *entity, const char *data, int len,
+                                     bool position_topic);
 
 static const cJSON *jobj(const cJSON *obj, const char *key)
 {
@@ -128,6 +134,19 @@ static int jint(const cJSON *obj, const char *key, int def)
 static void copy_str(char *dst, size_t len, const char *src)
 {
     snprintf(dst, len, "%s", src ? src : "");
+}
+
+static bool topic_matches(const char *expected, const char *topic, int topic_len)
+{
+    if (!expected || !expected[0] || !topic || topic_len <= 0) {
+        return false;
+    }
+    return (int)strlen(expected) == topic_len && strncmp(expected, topic, (size_t)topic_len) == 0;
+}
+
+static bool entity_uses_position_topic(const mqtt_entity_t *entity, const char *topic, int topic_len)
+{
+    return entity && topic_matches(entity->set_position_topic, topic, topic_len);
 }
 
 static bool str_ieq(const char *a, const char *b)
@@ -200,8 +219,8 @@ static mqtt_entity_t *find_entity_by_topic(const char *topic, int topic_len)
         if (!entity->used || !entity->supports_command) {
             continue;
         }
-        if ((int)strlen(entity->command_topic) == topic_len &&
-            strncmp(entity->command_topic, topic, (size_t)topic_len) == 0) {
+        if (topic_matches(entity->command_topic, topic, topic_len) ||
+            topic_matches(entity->set_position_topic, topic, topic_len)) {
             return entity;
         }
     }
@@ -240,6 +259,10 @@ static bool add_entity(entity_kind_t kind, const char *component, const char *id
     snprintf(entity->state_topic, sizeof(entity->state_topic), "%s/%s/state", s_cfg.topic_prefix, id);
     if (supports_command) {
         snprintf(entity->command_topic, sizeof(entity->command_topic), "%s/%s/set", s_cfg.topic_prefix, id);
+        if (strcmp(component, "cover") == 0) {
+            snprintf(entity->set_position_topic, sizeof(entity->set_position_topic),
+                     "%s/%s/set_position", s_cfg.topic_prefix, id);
+        }
     }
     snprintf(entity->config_topic, sizeof(entity->config_topic), "%s/%s/%s/%s/config",
              s_cfg.discovery_prefix, component, s_cfg.node_id, id);
@@ -302,15 +325,19 @@ static void build_entities_from_status(const cJSON *status)
                 continue;
             }
             const char *type = jstr(item, "type", "");
+            const char *role = jstr(item, "role", "");
             const char *component = "light";
             if (strcmp(type, "relay") == 0) {
                 component = "switch";
+            } else if ((strcmp(type, "stepper_28byj") == 0 || strcmp(type, "stepper_a4988") == 0) &&
+                       strcmp(role, "cover") == 0) {
+                component = "cover";
             } else if (strcmp(type, "servo_3wire") == 0 || strcmp(type, "servo_5wire") == 0 ||
                        strcmp(type, "stepper_28byj") == 0 || strcmp(type, "stepper_a4988") == 0) {
                 component = "number";
             }
             add_entity(ENTITY_KIND_OUTPUT, component, jstr(item, "id", ""),
-                       jstr(item, "name", ""), type, "", jstr(item, "id", ""), "", true,
+                       jstr(item, "name", ""), type, role, jstr(item, "id", ""), "", true,
                        jstr(item, "mode", ""));
         }
     }
@@ -411,6 +438,17 @@ static esp_err_t publish_discovery_entity(const mqtt_entity_t *entity)
         cJSON_AddStringToObject(root, "state_topic", entity->state_topic);
         cJSON_AddStringToObject(root, "payload_on", "ON");
         cJSON_AddStringToObject(root, "payload_off", "OFF");
+        cJSON_AddBoolToObject(root, "retain", s_cfg.retain);
+    } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->component, "cover") == 0) {
+        cJSON_AddStringToObject(root, "command_topic", entity->command_topic);
+        cJSON_AddStringToObject(root, "set_position_topic", entity->set_position_topic);
+        cJSON_AddStringToObject(root, "state_topic", entity->state_topic);
+        cJSON_AddStringToObject(root, "position_topic", entity->state_topic);
+        cJSON_AddStringToObject(root, "value_template", "{{ value_json.state }}");
+        cJSON_AddStringToObject(root, "position_template", "{{ value_json.position }}");
+        cJSON_AddStringToObject(root, "payload_open", "OPEN");
+        cJSON_AddStringToObject(root, "payload_close", "CLOSE");
+        cJSON_AddStringToObject(root, "payload_stop", "STOP");
         cJSON_AddBoolToObject(root, "retain", s_cfg.retain);
     } else if (entity->kind == ENTITY_KIND_OUTPUT &&
                (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0 ||
@@ -528,6 +566,15 @@ static esp_err_t build_entity_state_payload(const mqtt_entity_t *entity, const c
     if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "relay") == 0) {
         bool power = jbool(status, "power", false);
         snprintf(payload, payload_len, "%s", power ? "ON" : "OFF");
+    } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->component, "cover") == 0) {
+        int position = jint(status, "position", jint(status, "level", 0));
+        const char *cover_state = jstr(status, "state", "stopped");
+        const char *mqtt_state = cover_state;
+        if (strcmp(cover_state, "not_homed") == 0 || strcmp(cover_state, "homing") == 0) {
+            mqtt_state = "stopped";
+        }
+        snprintf(payload, payload_len, "{\"state\":\"%s\",\"position\":%d,\"cover_state\":\"%s\"}",
+                 mqtt_state, position, cover_state);
     } else if (entity->kind == ENTITY_KIND_OUTPUT &&
                (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0 ||
                 strcmp(entity->type, "stepper_28byj") == 0 || strcmp(entity->type, "stepper_a4988") == 0)) {
@@ -764,6 +811,50 @@ static esp_err_t apply_light_command(const mqtt_entity_t *entity, const char *da
     return err;
 }
 
+static esp_err_t apply_cover_command(const mqtt_entity_t *entity, const char *data, int len,
+                                     bool position_topic)
+{
+    char raw[32] = {0};
+    cJSON *action = NULL;
+    cJSON *resp = NULL;
+    esp_err_t err;
+
+    if (!entity || !data || len <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (position_topic) {
+        return apply_number_command(entity, data, len);
+    }
+
+    if (len >= (int)sizeof(raw)) {
+        len = (int)sizeof(raw) - 1;
+    }
+    memcpy(raw, data, (size_t)len);
+    raw[len] = 0;
+
+    action = cJSON_CreateObject();
+    if (!action) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (str_ieq(raw, "OPEN")) {
+        cJSON_AddStringToObject(action, "command", "open");
+    } else if (str_ieq(raw, "CLOSE")) {
+        cJSON_AddStringToObject(action, "command", "close");
+    } else if (str_ieq(raw, "STOP")) {
+        cJSON_AddStringToObject(action, "command", "stop");
+    } else {
+        cJSON_Delete(action);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = modules_action(entity->id, action, &resp);
+    cJSON_Delete(resp);
+    cJSON_Delete(action);
+    return err;
+}
+
 static esp_err_t apply_number_command(const mqtt_entity_t *entity, const char *data, int len)
 {
     char raw[32] = {0};
@@ -853,9 +944,13 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
         case MQTT_EVENT_CONNECTED:
             s_connected = true;
             ESP_LOGI(TAG, "connected to broker");
+            system_log_write("mqtt", "info", "Connected to broker");
             for (int i = 0; i < s_entity_count; ++i) {
                 if (s_entities[i].supports_command) {
                     (void)esp_mqtt_client_subscribe(s_client, s_entities[i].command_topic, 1);
+                    if (s_entities[i].set_position_topic[0] != 0) {
+                        (void)esp_mqtt_client_subscribe(s_client, s_entities[i].set_position_topic, 1);
+                    }
                 }
                 (void)publish_discovery_entity(&s_entities[i]);
             }
@@ -865,6 +960,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
         case MQTT_EVENT_DISCONNECTED:
             s_connected = false;
             ESP_LOGW(TAG, "disconnected from broker");
+            system_log_write("mqtt", "warn", "Disconnected from broker");
             break;
         case MQTT_EVENT_DATA: {
             if (event->current_data_offset != 0) {
@@ -877,6 +973,9 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
             esp_err_t err = ESP_OK;
             if (strcmp(entity->component, "switch") == 0) {
                 err = apply_relay_command(entity, event->data, event->data_len);
+            } else if (strcmp(entity->component, "cover") == 0) {
+                err = apply_cover_command(entity, event->data, event->data_len,
+                                          entity_uses_position_topic(entity, event->topic, event->topic_len));
             } else if (strcmp(entity->component, "number") == 0) {
                 err = apply_number_command(entity, event->data, event->data_len);
             } else {
@@ -889,6 +988,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
         }
         case MQTT_EVENT_ERROR:
             ESP_LOGW(TAG, "mqtt transport error");
+            system_log_write("mqtt", "error", "MQTT transport error");
             break;
         default:
             break;

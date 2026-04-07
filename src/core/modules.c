@@ -85,6 +85,7 @@ typedef struct {
     output_type_t type;
     char id[24];
     char name[40];
+    char role[16];
     int gpio;
     bool power;
     bool supported;
@@ -352,6 +353,8 @@ static esp_err_t read_ds18b20_locked(void);
 static esp_err_t set_pwm_power_relay_locked(output_runtime_t *out, bool on);
 static bool output_supports_power_control(const output_runtime_t *out);
 static bool output_supports_level_control(const output_runtime_t *out);
+static bool output_is_cover(const output_runtime_t *out);
+static const char *cover_state_text_locked(const output_runtime_t *out);
 static esp_err_t servo_5wire_set_drive_locked(output_runtime_t *out, int logical_direction);
 static int servo_5wire_feedback_to_level_locked(const output_runtime_t *out, int raw);
 static esp_err_t servo_5wire_read_feedback_locked(output_runtime_t *out, int *out_raw, int *out_level);
@@ -363,11 +366,13 @@ static esp_err_t stepper_28byj_release_locked(output_runtime_t *out);
 static bool stepper_28byj_home_active_locked(output_runtime_t *out);
 static void stepper_28byj_finish_home_locked(output_runtime_t *out);
 static esp_err_t stepper_28byj_start_home_locked(output_runtime_t *out);
+static esp_err_t stepper_28byj_stop_locked(output_runtime_t *out);
 static esp_err_t stepper_a4988_set_enable_locked(output_runtime_t *out, bool enabled);
 static esp_err_t stepper_a4988_step_locked(output_runtime_t *out, int logical_direction);
 static bool stepper_a4988_home_active_locked(output_runtime_t *out);
 static void stepper_a4988_finish_home_locked(output_runtime_t *out);
 static esp_err_t stepper_a4988_start_home_locked(output_runtime_t *out);
+static esp_err_t stepper_a4988_stop_locked(output_runtime_t *out);
 static bool update_stepper_28byj_control_locked(output_runtime_t *out, int64_t now_us);
 static bool update_stepper_a4988_control_locked(output_runtime_t *out, int64_t now_us);
 static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, uint8_t red, uint8_t green, uint8_t blue, int wipe_active_segments);
@@ -581,6 +586,53 @@ static bool output_supports_level_control(const output_runtime_t *out)
            out->type == OUTPUT_TYPE_SERVO_5WIRE ||
            out->type == OUTPUT_TYPE_STEPPER_28BYJ ||
            out->type == OUTPUT_TYPE_STEPPER_A4988;
+}
+
+static bool output_is_cover(const output_runtime_t *out)
+{
+    if (!out) {
+        return false;
+    }
+
+    return (out->type == OUTPUT_TYPE_STEPPER_28BYJ ||
+            out->type == OUTPUT_TYPE_STEPPER_A4988) &&
+           strcmp(out->role, "cover") == 0;
+}
+
+static const char *cover_state_text_locked(const output_runtime_t *out)
+{
+    if (!output_is_cover(out)) {
+        return "stopped";
+    }
+
+    if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+        if (out->cfg.stepper_28byj.homing) {
+            return "homing";
+        }
+        if (out->cfg.stepper_28byj.home_gpio >= 0 && !out->cfg.stepper_28byj.homed) {
+            return "not_homed";
+        }
+        if (out->cfg.stepper_28byj.moving) {
+            return (out->cfg.stepper_28byj.target_level >= out->cfg.stepper_28byj.current_level) ?
+                "opening" : "closing";
+        }
+        return "stopped";
+    }
+
+    if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+        if (out->cfg.stepper_a4988.homing) {
+            return "homing";
+        }
+        if (out->cfg.stepper_a4988.home_gpio >= 0 && !out->cfg.stepper_a4988.homed) {
+            return "not_homed";
+        }
+        if (out->cfg.stepper_a4988.moving) {
+            return (out->cfg.stepper_a4988.target_level >= out->cfg.stepper_a4988.current_level) ?
+                "opening" : "closing";
+        }
+    }
+
+    return "stopped";
 }
 
 static esp_err_t set_pwm_power_relay_locked(output_runtime_t *out, bool on)
@@ -927,6 +979,24 @@ static esp_err_t stepper_28byj_start_home_locked(output_runtime_t *out)
     return ESP_OK;
 }
 
+static esp_err_t stepper_28byj_stop_locked(output_runtime_t *out)
+{
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_28BYJ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    out->cfg.stepper_28byj.homing = false;
+    out->cfg.stepper_28byj.target_position_steps = out->cfg.stepper_28byj.current_position_steps;
+    out->cfg.stepper_28byj.target_level = out->cfg.stepper_28byj.current_level;
+    out->cfg.stepper_28byj.moving = false;
+    out->cfg.stepper_28byj.last_step_us = 0;
+    out->power = out->cfg.stepper_28byj.hold_enabled;
+    if (!out->cfg.stepper_28byj.hold_enabled) {
+        return stepper_28byj_release_locked(out);
+    }
+    return stepper_28byj_apply_phase_locked(out, out->cfg.stepper_28byj.phase_index);
+}
+
 static esp_err_t stepper_a4988_set_enable_locked(output_runtime_t *out, bool enabled)
 {
     if (!out || out->type != OUTPUT_TYPE_STEPPER_A4988) {
@@ -1025,6 +1095,21 @@ static esp_err_t stepper_a4988_start_home_locked(output_runtime_t *out)
     out->cfg.stepper_a4988.moving = true;
     out->power = true;
     return ESP_OK;
+}
+
+static esp_err_t stepper_a4988_stop_locked(output_runtime_t *out)
+{
+    if (!out || out->type != OUTPUT_TYPE_STEPPER_A4988) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    out->cfg.stepper_a4988.homing = false;
+    out->cfg.stepper_a4988.target_position_steps = out->cfg.stepper_a4988.current_position_steps;
+    out->cfg.stepper_a4988.target_level = out->cfg.stepper_a4988.current_level;
+    out->cfg.stepper_a4988.moving = false;
+    out->cfg.stepper_a4988.last_step_us = 0;
+    out->power = out->cfg.stepper_a4988.hold_enabled;
+    return stepper_a4988_set_enable_locked(out, out->cfg.stepper_a4988.hold_enabled);
 }
 
 static bool update_stepper_28byj_control_locked(output_runtime_t *out, int64_t now_us)
@@ -2022,6 +2107,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
     out->supported = true;
     snprintf(out->id, sizeof(out->id), "%s", jstr(item, "id", ""));
     snprintf(out->name, sizeof(out->name), "%s", jstr(item, "name", out->id));
+    snprintf(out->role, sizeof(out->role), "%s", jstr(item, "role", "generic"));
 
     if (!out->enabled) {
         return ESP_OK;
@@ -2191,6 +2277,9 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
     }
 
     if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+        if (strcmp(out->role, "cover") != 0) {
+            snprintf(out->role, sizeof(out->role), "%s", "generic");
+        }
         out->cfg.stepper_28byj.gpio_b = jint(item, "gpio_b", -1);
         out->cfg.stepper_28byj.gpio_c = jint(item, "gpio_c", -1);
         out->cfg.stepper_28byj.gpio_d = jint(item, "gpio_d", -1);
@@ -2274,6 +2363,9 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
     }
 
     if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+        if (strcmp(out->role, "cover") != 0) {
+            snprintf(out->role, sizeof(out->role), "%s", "generic");
+        }
         out->cfg.stepper_a4988.gpio_b = jint(item, "gpio_b", -1);
         out->cfg.stepper_a4988.gpio_c = jint(item, "gpio_c", -1);
         out->cfg.stepper_a4988.home_gpio = jint(item, "home_gpio", -1);
@@ -2940,6 +3032,9 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
     cJSON_AddStringToObject(obj, "id", out->id);
     cJSON_AddStringToObject(obj, "name", out->name);
     cJSON_AddStringToObject(obj, "type", output_type_to_text(out->type));
+    if (out->role[0]) {
+        cJSON_AddStringToObject(obj, "role", out->role);
+    }
     cJSON_AddBoolToObject(obj, "enabled", out->enabled);
     cJSON_AddBoolToObject(obj, "supported", out->supported);
     cJSON_AddNumberToObject(obj, "gpio", out->gpio);
@@ -2993,6 +3088,11 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
     } else if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
         cJSON_AddNumberToObject(obj, "level", out->cfg.stepper_28byj.current_level);
         cJSON_AddNumberToObject(obj, "target_level", out->cfg.stepper_28byj.target_level);
+        if (output_is_cover(out)) {
+            cJSON_AddNumberToObject(obj, "position", out->cfg.stepper_28byj.current_level);
+            cJSON_AddNumberToObject(obj, "target_position", out->cfg.stepper_28byj.target_level);
+            cJSON_AddStringToObject(obj, "state", cover_state_text_locked(out));
+        }
         cJSON_AddNumberToObject(obj, "gpio_b", out->cfg.stepper_28byj.gpio_b);
         cJSON_AddNumberToObject(obj, "gpio_c", out->cfg.stepper_28byj.gpio_c);
         cJSON_AddNumberToObject(obj, "gpio_d", out->cfg.stepper_28byj.gpio_d);
@@ -3015,6 +3115,11 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
     } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
         cJSON_AddNumberToObject(obj, "level", out->cfg.stepper_a4988.current_level);
         cJSON_AddNumberToObject(obj, "target_level", out->cfg.stepper_a4988.target_level);
+        if (output_is_cover(out)) {
+            cJSON_AddNumberToObject(obj, "position", out->cfg.stepper_a4988.current_level);
+            cJSON_AddNumberToObject(obj, "target_position", out->cfg.stepper_a4988.target_level);
+            cJSON_AddStringToObject(obj, "state", cover_state_text_locked(out));
+        }
         cJSON_AddNumberToObject(obj, "gpio_b", out->cfg.stepper_a4988.gpio_b);
         if (out->cfg.stepper_a4988.gpio_c >= 0) {
             cJSON_AddNumberToObject(obj, "gpio_c", out->cfg.stepper_a4988.gpio_c);
@@ -3263,13 +3368,26 @@ esp_err_t modules_action(const char *id, const cJSON *action, cJSON **out_respon
     } else {
         output_runtime_t *out = find_output_locked(id);
         if (out) {
+            const char *cmd = jstr(action, "command", "");
             if (jbool(action, "test", false)) {
                 err = start_output_test_locked(out, jint(action, "duration_ms", 1200));
-            } else if (jbool(action, "home", false)) {
+            } else if (jbool(action, "home", false) || strcmp(cmd, "home") == 0) {
                 if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
                     err = stepper_28byj_start_home_locked(out);
                 } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
                     err = stepper_a4988_start_home_locked(out);
+                } else {
+                    err = ESP_ERR_NOT_SUPPORTED;
+                }
+            } else if (strcmp(cmd, "open") == 0) {
+                err = set_output_level_locked(out, 100);
+            } else if (strcmp(cmd, "close") == 0) {
+                err = set_output_level_locked(out, 0);
+            } else if (strcmp(cmd, "stop") == 0) {
+                if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+                    err = stepper_28byj_stop_locked(out);
+                } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
+                    err = stepper_a4988_stop_locked(out);
                 } else {
                     err = ESP_ERR_NOT_SUPPORTED;
                 }

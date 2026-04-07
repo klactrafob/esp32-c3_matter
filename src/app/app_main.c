@@ -8,6 +8,7 @@
 
 #include "core/cfg_json.h"
 #include "core/modules.h"
+#include "core/system_log.h"
 
 #include "device_state.h"
 #include "app_watchdog.h"
@@ -29,6 +30,8 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(cfg_json_load_or_default());
+    system_log_init();
+    system_log_write("sys", "info", "Boot sequence started");
     ESP_ERROR_CHECK(app_watchdog_ensure_init());
     device_state_init();
     ESP_ERROR_CHECK(modules_init());
@@ -44,4 +47,5 @@ void app_main(void)
     ESP_ERROR_CHECK(app_loop_start());
 
     ESP_LOGI(TAG, "System started");
+    system_log_write("sys", "info", "System started");
 }

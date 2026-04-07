@@ -277,6 +277,25 @@ static const char *normalize_ws2812_transition_style(const char *value)
     return "none";
 }
 
+static const char *normalize_pull_value(const char *value)
+{
+    if (value && strcmp(value, "down") == 0) {
+        return "down";
+    }
+    if (value && strcmp(value, "none") == 0) {
+        return "none";
+    }
+    return "up";
+}
+
+static const char *normalize_stepper_role(const char *value)
+{
+    if (value && strcmp(value, "cover") == 0) {
+        return "cover";
+    }
+    return "generic";
+}
+
 static bool is_adc_feedback_gpio(int gpio)
 {
     return gpio == 0 || gpio == 1 || gpio == 2 || gpio == 3 || gpio == 4;
@@ -384,6 +403,11 @@ static cJSON *create_empty_schema(void)
     cJSON_AddBoolToObject(mqtt, "discovery", true);
     cJSON_AddBoolToObject(mqtt, "retain", true);
 
+    cJSON *web = cJSON_AddObjectToObject(root, "web");
+    cJSON *auth = cJSON_AddObjectToObject(web, "auth");
+    cJSON_AddBoolToObject(auth, "enable", false);
+    cJSON_AddStringToObject(auth, "password", "");
+
     cJSON_AddArrayToObject(root, "outputs");
     cJSON_AddArrayToObject(root, "inputs");
     cJSON_AddArrayToObject(root, "buttons");
@@ -450,12 +474,13 @@ static cJSON *normalize_config(const cJSON *src)
     char node_id[40] = {0};
     build_board_node_id(node_id, sizeof(node_id));
 
-    const bool src_is_v2 = jint(src, "schema_version", 0) == CFG_SCHEMA_VERSION;
     const cJSON *src_device = jobj(src, "device");
     const cJSON *src_conn = get_connectivity_obj(src);
     const cJSON *src_ap = jobj(src_conn, "ap");
     const cJSON *src_sta = jobj(src_conn, "sta");
     const cJSON *src_mqtt = get_mqtt_obj(src);
+    const cJSON *src_web = jobj(src, "web");
+    const cJSON *src_web_auth = jobj(src_web, "auth");
 
     cJSON *device = cJSON_GetObjectItemCaseSensitive(root, "device");
     cJSON *connectivity = cJSON_GetObjectItemCaseSensitive(root, "connectivity");
@@ -466,6 +491,8 @@ static cJSON *normalize_config(const cJSON *src)
     cJSON *inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
     cJSON *buttons = cJSON_GetObjectItemCaseSensitive(root, "buttons");
     cJSON *sensors = cJSON_GetObjectItemCaseSensitive(root, "sensors");
+    cJSON *web = cJSON_GetObjectItemCaseSensitive(root, "web");
+    cJSON *web_auth = cJSON_GetObjectItemCaseSensitive(web, "auth");
 
     const char *device_name = jstr(src_device, "name",
                                    jstr(src_mqtt, "device_name", DEVICE_NAME_DEFAULT));
@@ -503,6 +530,8 @@ static cJSON *normalize_config(const cJSON *src)
                                                       MQTT_DISCOVERY_PREFIX_DEFAULT)));
     cJSON_ReplaceItemInObject(mqtt, "discovery", cJSON_CreateBool(jbool(src_mqtt, "discovery", true)));
     cJSON_ReplaceItemInObject(mqtt, "retain", cJSON_CreateBool(jbool(src_mqtt, "retain", true)));
+    cJSON_ReplaceItemInObject(web_auth, "enable", cJSON_CreateBool(jbool(src_web_auth, "enable", false)));
+    cJSON_ReplaceItemInObject(web_auth, "password", cJSON_CreateString(jstr(src_web_auth, "password", "")));
 
     cfg_validation_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
@@ -512,7 +541,7 @@ static cJSON *normalize_config(const cJSON *src)
     }
     snprintf(ctx->board_profile, sizeof(ctx->board_profile), "%s", board_profile);
 
-    const cJSON *src_outputs = src_is_v2 ? jobj(src, "outputs") : NULL;
+    const cJSON *src_outputs = jobj(src, "outputs");
     if (cJSON_IsArray((cJSON *)src_outputs)) {
         int count = cJSON_GetArraySize((cJSON *)src_outputs);
         if (count > CFG_MAX_OUTPUTS) {
@@ -537,7 +566,9 @@ static cJSON *normalize_config(const cJSON *src)
                 strcmp(type, "pwm") != 0 &&
                 strcmp(type, "ws2812") != 0 &&
                 strcmp(type, "servo_3wire") != 0 &&
-                strcmp(type, "servo_5wire") != 0) {
+                strcmp(type, "servo_5wire") != 0 &&
+                strcmp(type, "stepper_28byj") != 0 &&
+                strcmp(type, "stepper_a4988") != 0) {
                 set_error("Output %s uses unsupported type '%s'", id, type);
                 return normalize_cleanup_and_fail(root, ctx);
             }
@@ -626,6 +657,7 @@ static cJSON *normalize_config(const cJSON *src)
                 cJSON_AddStringToObject(dst, "transition_style", transition_style);
                 cJSON_AddNumberToObject(dst, "transition_ms", transition_ms);
                 cJSON_AddBoolToObject(dst, "default_power_on", jbool(item, "default_power_on", false));
+                cJSON_AddBoolToObject(dst, "gamma_correction", jbool(item, "gamma_correction", false));
             } else if (strcmp(type, "servo_3wire") == 0) {
                 int default_level = jint(item, "default_level", 0);
                 int min_us = jint(item, "min_us", 500);
@@ -648,7 +680,7 @@ static cJSON *normalize_config(const cJSON *src)
                 cJSON_AddNumberToObject(dst, "default_level", default_level);
                 cJSON_AddNumberToObject(dst, "min_us", min_us);
                 cJSON_AddNumberToObject(dst, "max_us", max_us);
-            } else {
+            } else if (strcmp(type, "servo_5wire") == 0) {
                 int gpio_b = jint(item, "gpio_b", -1);
                 int feedback_gpio = jint(item, "feedback_gpio", -1);
                 int default_level = jint(item, "default_level", 0);
@@ -703,6 +735,141 @@ static cJSON *normalize_config(const cJSON *src)
                 cJSON_AddNumberToObject(dst, "deadband_pct", deadband_pct);
                 cJSON_AddNumberToObject(dst, "move_timeout_ms", move_timeout_ms);
                 cJSON_AddBoolToObject(dst, "reverse_direction", jbool(item, "reverse_direction", false));
+            } else if (strcmp(type, "stepper_28byj") == 0) {
+                int gpio_b = jint(item, "gpio_b", -1);
+                int gpio_c = jint(item, "gpio_c", -1);
+                int gpio_d = jint(item, "gpio_d", -1);
+                int home_gpio = jint(item, "home_gpio", -1);
+                int default_level = jint(item, "default_level", 0);
+                int steps_range = jint(item, "steps_range", 2048);
+                int speed_steps_per_sec = jint(item, "speed_steps_per_sec", 400);
+                const char *home_pull = normalize_pull_value(jstr(item, "home_pull", "up"));
+                const char *role = normalize_stepper_role(jstr(item, "role", "generic"));
+
+                char owner_b[40] = {0};
+                char owner_c[40] = {0};
+                char owner_d[40] = {0};
+                char owner_home[40] = {0};
+                snprintf(owner_b, sizeof(owner_b), "stepper28-b:%s", id);
+                snprintf(owner_c, sizeof(owner_c), "stepper28-c:%s", id);
+                snprintf(owner_d, sizeof(owner_d), "stepper28-d:%s", id);
+                snprintf(owner_home, sizeof(owner_home), "stepper28-home:%s", id);
+
+                if (!reserve_gpio(ctx, gpio_b, owner_b, "") ||
+                    !reserve_gpio(ctx, gpio_c, owner_c, "") ||
+                    !reserve_gpio(ctx, gpio_d, owner_d, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+                if (home_gpio >= 0 && !reserve_gpio(ctx, home_gpio, owner_home, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+
+                if (default_level < 0) {
+                    default_level = 0;
+                }
+                if (default_level > 100) {
+                    default_level = 100;
+                }
+                if (steps_range < 32) {
+                    steps_range = 32;
+                }
+                if (steps_range > 200000) {
+                    steps_range = 200000;
+                }
+                if (speed_steps_per_sec < 10) {
+                    speed_steps_per_sec = 10;
+                }
+                if (speed_steps_per_sec > 1500) {
+                    speed_steps_per_sec = 1500;
+                }
+
+                cJSON_AddStringToObject(dst, "role", role);
+                cJSON_AddNumberToObject(dst, "gpio_b", gpio_b);
+                cJSON_AddNumberToObject(dst, "gpio_c", gpio_c);
+                cJSON_AddNumberToObject(dst, "gpio_d", gpio_d);
+                if (home_gpio >= 0) {
+                    cJSON_AddNumberToObject(dst, "home_gpio", home_gpio);
+                    cJSON_AddStringToObject(dst, "home_pull", home_pull);
+                }
+                cJSON_AddBoolToObject(dst, "home_inverted", jbool(item, "home_inverted", false));
+                cJSON_AddBoolToObject(dst, "auto_home_on_boot", jbool(item, "auto_home_on_boot", false));
+                cJSON_AddNumberToObject(dst, "default_level", default_level);
+                cJSON_AddNumberToObject(dst, "steps_range", steps_range);
+                cJSON_AddNumberToObject(dst, "speed_steps_per_sec", speed_steps_per_sec);
+                cJSON_AddBoolToObject(dst, "reverse_direction", jbool(item, "reverse_direction", false));
+                cJSON_AddBoolToObject(dst, "hold_enabled", jbool(item, "hold_enabled", false));
+            } else if (strcmp(type, "stepper_a4988") == 0) {
+                int gpio_b = jint(item, "gpio_b", -1);
+                int gpio_c = jint(item, "gpio_c", -1);
+                int home_gpio = jint(item, "home_gpio", -1);
+                int enable_active_level = jint(item, "enable_active_level", 0) ? 1 : 0;
+                int default_level = jint(item, "default_level", 0);
+                int steps_range = jint(item, "steps_range", 200);
+                int speed_steps_per_sec = jint(item, "speed_steps_per_sec", 800);
+                int step_pulse_us = jint(item, "step_pulse_us", 4);
+                const char *home_pull = normalize_pull_value(jstr(item, "home_pull", "up"));
+                const char *role = normalize_stepper_role(jstr(item, "role", "generic"));
+
+                char owner_b[40] = {0};
+                char owner_c[40] = {0};
+                char owner_home[40] = {0};
+                snprintf(owner_b, sizeof(owner_b), "steppera-dir:%s", id);
+                snprintf(owner_c, sizeof(owner_c), "steppera-en:%s", id);
+                snprintf(owner_home, sizeof(owner_home), "steppera-home:%s", id);
+
+                if (!reserve_gpio(ctx, gpio_b, owner_b, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+                if (gpio_c >= 0 && !reserve_gpio(ctx, gpio_c, owner_c, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+                if (home_gpio >= 0 && !reserve_gpio(ctx, home_gpio, owner_home, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+
+                if (default_level < 0) {
+                    default_level = 0;
+                }
+                if (default_level > 100) {
+                    default_level = 100;
+                }
+                if (steps_range < 32) {
+                    steps_range = 32;
+                }
+                if (steps_range > 200000) {
+                    steps_range = 200000;
+                }
+                if (speed_steps_per_sec < 10) {
+                    speed_steps_per_sec = 10;
+                }
+                if (speed_steps_per_sec > 20000) {
+                    speed_steps_per_sec = 20000;
+                }
+                if (step_pulse_us < 2) {
+                    step_pulse_us = 2;
+                }
+                if (step_pulse_us > 20) {
+                    step_pulse_us = 20;
+                }
+
+                cJSON_AddStringToObject(dst, "role", role);
+                cJSON_AddNumberToObject(dst, "gpio_b", gpio_b);
+                if (gpio_c >= 0) {
+                    cJSON_AddNumberToObject(dst, "gpio_c", gpio_c);
+                    cJSON_AddNumberToObject(dst, "enable_active_level", enable_active_level);
+                }
+                if (home_gpio >= 0) {
+                    cJSON_AddNumberToObject(dst, "home_gpio", home_gpio);
+                    cJSON_AddStringToObject(dst, "home_pull", home_pull);
+                }
+                cJSON_AddBoolToObject(dst, "home_inverted", jbool(item, "home_inverted", false));
+                cJSON_AddBoolToObject(dst, "auto_home_on_boot", jbool(item, "auto_home_on_boot", false));
+                cJSON_AddNumberToObject(dst, "default_level", default_level);
+                cJSON_AddNumberToObject(dst, "steps_range", steps_range);
+                cJSON_AddNumberToObject(dst, "speed_steps_per_sec", speed_steps_per_sec);
+                cJSON_AddNumberToObject(dst, "step_pulse_us", step_pulse_us);
+                cJSON_AddBoolToObject(dst, "reverse_direction", jbool(item, "reverse_direction", false));
+                cJSON_AddBoolToObject(dst, "hold_enabled", jbool(item, "hold_enabled", false));
             }
 
             cJSON_AddItemToArray(outputs, dst);
@@ -730,7 +897,7 @@ static cJSON *normalize_config(const cJSON *src)
         }
     }
 
-    const cJSON *src_inputs = src_is_v2 ? jobj(src, "inputs") : NULL;
+    const cJSON *src_inputs = jobj(src, "inputs");
     int input_count = 0;
     if (cJSON_IsArray((cJSON *)src_inputs)) {
         input_count = cJSON_GetArraySize((cJSON *)src_inputs);
@@ -787,7 +954,7 @@ static cJSON *normalize_config(const cJSON *src)
         }
     }
 
-    const cJSON *src_buttons = src_is_v2 ? jobj(src, "buttons") : NULL;
+    const cJSON *src_buttons = jobj(src, "buttons");
     int button_count = 0;
     if (cJSON_IsArray((cJSON *)src_buttons)) {
         button_count = cJSON_GetArraySize((cJSON *)src_buttons);
@@ -842,7 +1009,7 @@ static cJSON *normalize_config(const cJSON *src)
         }
     }
 
-    const cJSON *src_sensors = src_is_v2 ? jobj(src, "sensors") : NULL;
+    const cJSON *src_sensors = jobj(src, "sensors");
     if (cJSON_IsArray((cJSON *)src_sensors)) {
         int count = cJSON_GetArraySize((cJSON *)src_sensors);
         int ds18b20_bus_count = 0;

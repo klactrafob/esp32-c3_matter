@@ -15,6 +15,7 @@ bool wifi_mgr_is_ap(void);
 const char *wifi_mgr_get_ap_ssid(void);
 bool wifi_mgr_sta_configured(void);
 bool wifi_mgr_sta_has_ip(void);
+int wifi_mgr_get_sta_rssi(void);
 
 #ifdef __cplusplus
 }
