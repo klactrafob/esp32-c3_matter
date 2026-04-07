@@ -6,6 +6,10 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "mqtt_client.h"
 
 #include "core/modules.h"
@@ -13,6 +17,9 @@
 static const char *TAG = "mqtt_mgr";
 
 #define MQTT_MAX_ENTITIES 24
+#define MQTT_STATE_PAYLOAD_MAX 256
+#define MQTT_OUTPUT_THROTTLE_MS 250
+#define MQTT_FLUSH_TASK_PERIOD_MS 100
 
 typedef enum {
     ENTITY_KIND_NONE = 0,
@@ -53,6 +60,11 @@ typedef struct {
     char command_topic[160];
     char state_topic[160];
     char config_topic[192];
+    bool has_last_published_payload;
+    bool pending_publish;
+    int64_t last_publish_us;
+    char last_published_payload[MQTT_STATE_PAYLOAD_MAX];
+    char pending_payload[MQTT_STATE_PAYLOAD_MAX];
 } mqtt_entity_t;
 
 static mqtt_cfg_t s_cfg = {0};
@@ -61,6 +73,8 @@ static int s_entity_count = 0;
 static esp_mqtt_client_handle_t s_client = NULL;
 static bool s_connected = false;
 static char s_availability_topic[160] = {0};
+static SemaphoreHandle_t s_state_lock = NULL;
+static TaskHandle_t s_flush_task = NULL;
 
 static const cJSON *jobj(const cJSON *obj, const char *key);
 static const char *jstr(const cJSON *obj, const char *key, const char *def);
@@ -68,6 +82,12 @@ static bool jbool(const cJSON *obj, const char *key, bool def);
 static int jint(const cJSON *obj, const char *key, int def);
 static void modules_runtime_changed_cb(void *ctx);
 static esp_err_t publish_all_states(void);
+static esp_err_t publish_state_snapshot(bool force_all, bool allow_throttle);
+static esp_err_t build_entity_state_payload(const mqtt_entity_t *entity, const cJSON *status,
+                                            char *payload, size_t payload_len);
+static int entity_publish_throttle_ms(const mqtt_entity_t *entity);
+static esp_err_t flush_pending_entity_updates(void);
+static esp_err_t ensure_flush_task(void);
 static esp_err_t apply_number_command(const mqtt_entity_t *entity, const char *data, int len);
 
 static const cJSON *jobj(const cJSON *obj, const char *key)
@@ -132,6 +152,45 @@ static esp_err_t publish_raw(const char *topic, const char *payload, int qos, bo
     }
     int msg_id = esp_mqtt_client_publish(s_client, topic, payload, 0, qos, retain ? 1 : 0);
     return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+static int entity_publish_throttle_ms(const mqtt_entity_t *entity)
+{
+    if (!entity) {
+        return 0;
+    }
+    if (strcmp(entity->component, "light") == 0 || strcmp(entity->component, "number") == 0) {
+        return MQTT_OUTPUT_THROTTLE_MS;
+    }
+    return 0;
+}
+
+static void mqtt_flush_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MQTT_FLUSH_TASK_PERIOD_MS));
+        (void)flush_pending_entity_updates();
+    }
+}
+
+static esp_err_t ensure_flush_task(void)
+{
+    if (!s_state_lock) {
+        s_state_lock = xSemaphoreCreateMutex();
+        if (!s_state_lock) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (!s_flush_task) {
+        if (xTaskCreate(mqtt_flush_task, "mqtt_flush", 4096, NULL, 4, &s_flush_task) != pdPASS) {
+            return ESP_FAIL;
+        }
+    }
+
+    return ESP_OK;
 }
 
 static mqtt_entity_t *find_entity_by_topic(const char *topic, int topic_len)
@@ -458,74 +517,128 @@ static const cJSON *find_sensor_status_item(const cJSON *arr, const mqtt_entity_
     return NULL;
 }
 
-static esp_err_t publish_entity_state_from_status(const mqtt_entity_t *entity, const cJSON *status)
+static esp_err_t build_entity_state_payload(const mqtt_entity_t *entity, const cJSON *status,
+                                            char *payload, size_t payload_len)
 {
-    if (!entity || !status) {
+    if (!entity || !status || !payload || payload_len < 2) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    char payload[256] = {0};
+    payload[0] = 0;
     if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "relay") == 0) {
         bool power = jbool(status, "power", false);
-        snprintf(payload, sizeof(payload), "%s", power ? "ON" : "OFF");
+        snprintf(payload, payload_len, "%s", power ? "ON" : "OFF");
     } else if (entity->kind == ENTITY_KIND_OUTPUT &&
                (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0 ||
                 strcmp(entity->type, "stepper_28byj") == 0 || strcmp(entity->type, "stepper_a4988") == 0)) {
         int level = jint(status, "level", 0);
-        snprintf(payload, sizeof(payload), "%d", level);
+        snprintf(payload, payload_len, "%d", level);
     } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "pwm") == 0) {
         bool power = jbool(status, "power", false);
         int level = jint(status, "level", 0);
         int brightness = (level * 255) / 100;
-        snprintf(payload, sizeof(payload), "{\"state\":\"%s\",\"brightness\":%d}",
+        snprintf(payload, payload_len, "{\"state\":\"%s\",\"brightness\":%d}",
                  power ? "ON" : "OFF", brightness);
     } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "ws2812") == 0) {
         bool power = jbool(status, "power", false);
         int brightness = jint(status, "brightness", 0);
         if (strcmp(entity->output_mode, "mono_triplet") == 0) {
-            snprintf(payload, sizeof(payload), "{\"state\":\"%s\",\"brightness\":%d}",
+            snprintf(payload, payload_len, "{\"state\":\"%s\",\"brightness\":%d}",
                      power ? "ON" : "OFF", brightness);
         } else {
             const cJSON *color = jobj(status, "color");
-            snprintf(payload, sizeof(payload),
+            snprintf(payload, payload_len,
                      "{\"state\":\"%s\",\"brightness\":%d,\"color\":{\"r\":%d,\"g\":%d,\"b\":%d}}",
                      power ? "ON" : "OFF", brightness,
                      jint(color, "r", 255), jint(color, "g", 255), jint(color, "b", 255));
         }
     } else if (entity->kind == ENTITY_KIND_INPUT) {
         bool state = jbool(status, "state", false);
-        snprintf(payload, sizeof(payload), "%s", state ? "ON" : "OFF");
+        snprintf(payload, payload_len, "%s", state ? "ON" : "OFF");
     } else if (entity->kind == ENTITY_KIND_SENSOR) {
         const cJSON *metric = cJSON_GetObjectItemCaseSensitive((cJSON *)status, entity->metric);
         if (!cJSON_IsNumber(metric)) {
             return ESP_ERR_NOT_FOUND;
         }
-        snprintf(payload, sizeof(payload), "%.2f", metric->valuedouble);
+        snprintf(payload, payload_len, "%.2f", metric->valuedouble);
     } else {
         return ESP_OK;
     }
 
-    return publish_raw(entity->state_topic, payload, 1, s_cfg.retain);
+    return ESP_OK;
 }
 
-static esp_err_t publish_all_states(void)
+static esp_err_t flush_pending_entity_updates(void)
 {
+    esp_err_t result = ESP_OK;
+    int64_t now_us = esp_timer_get_time();
+
+    if (!s_connected || !s_state_lock) {
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
+    for (int i = 0; i < s_entity_count; ++i) {
+        mqtt_entity_t *entity = &s_entities[i];
+        int throttle_ms = entity_publish_throttle_ms(entity);
+
+        if (!entity->used || !entity->pending_publish) {
+            continue;
+        }
+        if (throttle_ms > 0 && entity->last_publish_us > 0 &&
+            now_us < entity->last_publish_us + ((int64_t)throttle_ms * 1000LL)) {
+            continue;
+        }
+
+        if (publish_raw(entity->state_topic, entity->pending_payload, 1, s_cfg.retain) == ESP_OK) {
+            copy_str(entity->last_published_payload, sizeof(entity->last_published_payload), entity->pending_payload);
+            entity->has_last_published_payload = true;
+            entity->last_publish_us = now_us;
+            entity->pending_publish = false;
+            entity->pending_payload[0] = 0;
+        } else {
+            result = ESP_FAIL;
+        }
+    }
+    xSemaphoreGive(s_state_lock);
+
+    return result;
+}
+
+static esp_err_t publish_state_snapshot(bool force_all, bool allow_throttle)
+{
+    cJSON *status;
+    const cJSON *outputs;
+    const cJSON *inputs;
+    const cJSON *sensors;
+    bool wake_flush_task = false;
+
     if (!s_connected) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    cJSON *status = modules_build_status_json();
+    status = modules_build_status_json();
     if (!status) {
         return ESP_ERR_NO_MEM;
     }
 
-    const cJSON *outputs = jobj(status, "outputs");
-    const cJSON *inputs = jobj(status, "inputs");
-    const cJSON *sensors = jobj(status, "sensors");
+    outputs = jobj(status, "outputs");
+    inputs = jobj(status, "inputs");
+    sensors = jobj(status, "sensors");
 
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
     for (int i = 0; i < s_entity_count; ++i) {
-        const mqtt_entity_t *entity = &s_entities[i];
+        mqtt_entity_t *entity = &s_entities[i];
         const cJSON *item = NULL;
+        char payload[MQTT_STATE_PAYLOAD_MAX] = {0};
+        bool changed = false;
+        int throttle_ms;
+        int64_t now_us;
+
+        if (!entity->used) {
+            continue;
+        }
+
         if (entity->kind == ENTITY_KIND_OUTPUT) {
             item = find_status_item(outputs, entity->id);
         } else if (entity->kind == ENTITY_KIND_INPUT) {
@@ -533,13 +646,61 @@ static esp_err_t publish_all_states(void)
         } else if (entity->kind == ENTITY_KIND_SENSOR) {
             item = find_sensor_status_item(sensors, entity);
         }
-        if (item) {
-            (void)publish_entity_state_from_status(entity, item);
+        if (!item || build_entity_state_payload(entity, item, payload, sizeof(payload)) != ESP_OK) {
+            continue;
+        }
+
+        if (entity->pending_publish && entity->has_last_published_payload &&
+            strcmp(entity->last_published_payload, payload) == 0) {
+            entity->pending_publish = false;
+            entity->pending_payload[0] = 0;
+            continue;
+        }
+
+        if (entity->pending_publish) {
+            changed = strcmp(entity->pending_payload, payload) != 0;
+        } else if (entity->has_last_published_payload) {
+            changed = strcmp(entity->last_published_payload, payload) != 0;
+        } else {
+            changed = true;
+        }
+
+        if (!force_all && !changed) {
+            continue;
+        }
+
+        throttle_ms = allow_throttle ? entity_publish_throttle_ms(entity) : 0;
+        now_us = esp_timer_get_time();
+        if (!force_all && throttle_ms > 0 && entity->last_publish_us > 0 &&
+            now_us < entity->last_publish_us + ((int64_t)throttle_ms * 1000LL)) {
+            copy_str(entity->pending_payload, sizeof(entity->pending_payload), payload);
+            entity->pending_publish = true;
+            wake_flush_task = true;
+            continue;
+        }
+
+        if (publish_raw(entity->state_topic, payload, 1, s_cfg.retain) == ESP_OK) {
+            copy_str(entity->last_published_payload, sizeof(entity->last_published_payload), payload);
+            entity->has_last_published_payload = true;
+            entity->last_publish_us = now_us;
+            entity->pending_publish = false;
+            entity->pending_payload[0] = 0;
         }
     }
+    xSemaphoreGive(s_state_lock);
 
     cJSON_Delete(status);
+
+    if (wake_flush_task && s_flush_task) {
+        xTaskNotifyGive(s_flush_task);
+    }
+
     return ESP_OK;
+}
+
+static esp_err_t publish_all_states(void)
+{
+    return publish_state_snapshot(true, false);
 }
 
 static esp_err_t apply_light_command(const mqtt_entity_t *entity, const char *data, int len)
@@ -771,13 +932,18 @@ esp_err_t mqtt_mgr_notify_runtime_changed(void)
     if (!s_cfg.enabled || !s_connected) {
         return ESP_OK;
     }
-    return publish_all_states();
+    return publish_state_snapshot(false, true);
 }
 
 esp_err_t mqtt_mgr_start_from_cfg(const cJSON *cfg)
 {
     mqtt_cfg_t next_cfg;
     esp_err_t err = parse_cfg(cfg, &next_cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = ensure_flush_task();
     if (err != ESP_OK) {
         return err;
     }
