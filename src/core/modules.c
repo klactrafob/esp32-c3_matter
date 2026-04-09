@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "aht20.h"
 #include "bme280.h"
@@ -46,6 +47,7 @@ typedef enum {
     OUTPUT_TYPE_WS2812,
     OUTPUT_TYPE_SERVO_3WIRE,
     OUTPUT_TYPE_SERVO_5WIRE,
+    OUTPUT_TYPE_CLOCK_4X4094,
     OUTPUT_TYPE_STEPPER_28BYJ,
     OUTPUT_TYPE_STEPPER_A4988,
 } output_type_t;
@@ -165,6 +167,30 @@ typedef struct {
             bool timed_out;
             int64_t drive_started_us;
         } servo_5wire;
+        struct {
+            int gpio_b;
+            int gpio_c;
+            int brightness_gpio;
+            uint8_t segment_map[8];
+            int level;
+            int blink_period_ms;
+            int timezone_offset_min;
+            bool default_on;
+            bool common_anode;
+            bool mirror_segments;
+            bool reverse_digits;
+            bool leading_zero;
+            bool blink_separator;
+            bool time_valid;
+            bool separator_on;
+            int display_hour;
+            int display_minute;
+            int64_t last_render_us;
+            char display_text[8];
+            uint8_t segments[4];
+            ledc_channel_t channel;
+            ledc_timer_t timer;
+        } clock_4x4094;
         struct {
             int gpio_b;
             int gpio_c;
@@ -375,6 +401,8 @@ static esp_err_t stepper_a4988_start_home_locked(output_runtime_t *out);
 static esp_err_t stepper_a4988_stop_locked(output_runtime_t *out);
 static bool update_stepper_28byj_control_locked(output_runtime_t *out, int64_t now_us);
 static bool update_stepper_a4988_control_locked(output_runtime_t *out, int64_t now_us);
+static esp_err_t clock_4x4094_apply_state_locked(output_runtime_t *out, int64_t now_us, bool force_render);
+static bool update_clock_4x4094_locked(output_runtime_t *out, int64_t now_us);
 static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, uint8_t red, uint8_t green, uint8_t blue, int wipe_active_segments);
 static esp_err_t apply_ws2812_target_locked(output_runtime_t *out, bool allow_transition);
 static void update_ws2812_transitions_locked(int64_t now_us);
@@ -455,6 +483,9 @@ static output_type_t output_type_from_text(const char *type)
     if (strcmp(type, "servo_5wire") == 0) {
         return OUTPUT_TYPE_SERVO_5WIRE;
     }
+    if (strcmp(type, "clock_4x4094") == 0) {
+        return OUTPUT_TYPE_CLOCK_4X4094;
+    }
     if (strcmp(type, "stepper_28byj") == 0) {
         return OUTPUT_TYPE_STEPPER_28BYJ;
     }
@@ -472,6 +503,7 @@ static const char *output_type_to_text(output_type_t type)
         case OUTPUT_TYPE_WS2812: return "ws2812";
         case OUTPUT_TYPE_SERVO_3WIRE: return "servo_3wire";
         case OUTPUT_TYPE_SERVO_5WIRE: return "servo_5wire";
+        case OUTPUT_TYPE_CLOCK_4X4094: return "clock_4x4094";
         case OUTPUT_TYPE_STEPPER_28BYJ: return "stepper_28byj";
         case OUTPUT_TYPE_STEPPER_A4988: return "stepper_a4988";
         default: return "unknown";
@@ -571,7 +603,8 @@ static bool output_supports_power_control(const output_runtime_t *out)
 
     return out->type == OUTPUT_TYPE_RELAY ||
            out->type == OUTPUT_TYPE_PWM ||
-           out->type == OUTPUT_TYPE_WS2812;
+           out->type == OUTPUT_TYPE_WS2812 ||
+           out->type == OUTPUT_TYPE_CLOCK_4X4094;
 }
 
 static bool output_supports_level_control(const output_runtime_t *out)
@@ -584,6 +617,7 @@ static bool output_supports_level_control(const output_runtime_t *out)
            out->type == OUTPUT_TYPE_WS2812 ||
            out->type == OUTPUT_TYPE_SERVO_3WIRE ||
            out->type == OUTPUT_TYPE_SERVO_5WIRE ||
+           out->type == OUTPUT_TYPE_CLOCK_4X4094 ||
            out->type == OUTPUT_TYPE_STEPPER_28BYJ ||
            out->type == OUTPUT_TYPE_STEPPER_A4988;
 }
@@ -633,6 +667,257 @@ static const char *cover_state_text_locked(const output_runtime_t *out)
     }
 
     return "stopped";
+}
+
+static bool clock_time_is_valid(void)
+{
+    time_t now = time(NULL);
+    return now >= 1704067200; // 2024-01-01 UTC
+}
+
+static uint8_t clock_4x4094_encode_char(char ch, bool separator_on)
+{
+    uint8_t segments = 0x00;
+
+    switch (ch) {
+        case '0': segments = 0x3F; break;
+        case '1': segments = 0x06; break;
+        case '2': segments = 0x5B; break;
+        case '3': segments = 0x4F; break;
+        case '4': segments = 0x66; break;
+        case '5': segments = 0x6D; break;
+        case '6': segments = 0x7D; break;
+        case '7': segments = 0x07; break;
+        case '8': segments = 0x7F; break;
+        case '9': segments = 0x6F; break;
+        case '-': segments = 0x40; break;
+        default: segments = 0x00; break;
+    }
+
+    if (separator_on) {
+        segments |= 0x80;
+    }
+    return segments;
+}
+
+static uint8_t clock_4x4094_mirror_segments(uint8_t segments)
+{
+    uint8_t mirrored = segments & ((1U << 0) | (1U << 3) | (1U << 6) | (1U << 7));
+
+    if (segments & (1U << 1)) {
+        mirrored |= (1U << 5);
+    }
+    if (segments & (1U << 5)) {
+        mirrored |= (1U << 1);
+    }
+    if (segments & (1U << 2)) {
+        mirrored |= (1U << 4);
+    }
+    if (segments & (1U << 4)) {
+        mirrored |= (1U << 2);
+    }
+
+    return mirrored;
+}
+
+static uint8_t clock_4x4094_remap_segments(uint8_t segments, const uint8_t segment_map[8])
+{
+    uint8_t remapped = 0x00;
+
+    if (!segment_map) {
+        return segments;
+    }
+
+    for (int logical = 0; logical < 8; ++logical) {
+        uint8_t physical = segment_map[logical];
+        if (physical > 7U) {
+            physical = (uint8_t)logical;
+        }
+        if (segments & (1U << logical)) {
+            remapped |= (uint8_t)(1U << physical);
+        }
+    }
+
+    return remapped;
+}
+
+static void clock_4x4094_shift_byte_locked(output_runtime_t *out, uint8_t value)
+{
+    for (int bit = 7; bit >= 0; --bit) {
+        (void)gpio_set_level((gpio_num_t)out->gpio, (value >> bit) & 0x01);
+        (void)gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_b, 1);
+        esp_rom_delay_us(1);
+        (void)gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_b, 0);
+    }
+}
+
+static void clock_4x4094_build_display_locked(output_runtime_t *out, int64_t now_us,
+                                              char digits[4], char text[8],
+                                              bool *time_valid, bool *separator_on)
+{
+    bool valid = clock_time_is_valid();
+    bool separator = false;
+
+    digits[0] = ' ';
+    digits[1] = ' ';
+    digits[2] = ' ';
+    digits[3] = ' ';
+    snprintf(text, 8, "%s", out->power ? "----" : "OFF");
+
+    if (out->test_active) {
+        digits[0] = '8';
+        digits[1] = '8';
+        digits[2] = '8';
+        digits[3] = '8';
+        separator = out->cfg.clock_4x4094.blink_separator;
+        snprintf(text, 8, "88:88");
+        *time_valid = valid;
+        *separator_on = separator;
+        return;
+    }
+
+    if (!out->power) {
+        *time_valid = valid;
+        *separator_on = false;
+        return;
+    }
+
+    if (!valid) {
+        digits[0] = '-';
+        digits[1] = '-';
+        digits[2] = '-';
+        digits[3] = '-';
+        snprintf(text, 8, "--:--");
+        *time_valid = false;
+        *separator_on = false;
+        return;
+    }
+
+    time_t shifted = time(NULL) + ((time_t)out->cfg.clock_4x4094.timezone_offset_min * 60);
+    struct tm tm_now = {0};
+    gmtime_r(&shifted, &tm_now);
+
+    digits[0] = (char)('0' + (tm_now.tm_hour / 10));
+    digits[1] = (char)('0' + (tm_now.tm_hour % 10));
+    digits[2] = (char)('0' + (tm_now.tm_min / 10));
+    digits[3] = (char)('0' + (tm_now.tm_min % 10));
+    if (!out->cfg.clock_4x4094.leading_zero && tm_now.tm_hour < 10) {
+        digits[0] = ' ';
+    }
+
+    if (!out->cfg.clock_4x4094.blink_separator) {
+        separator = true;
+    } else {
+        int64_t blink_period_us = (int64_t)out->cfg.clock_4x4094.blink_period_ms * 1000LL;
+        int64_t half_period_us = blink_period_us / 2LL;
+        if (half_period_us <= 0LL) {
+            half_period_us = 1000000LL;
+        }
+        separator = ((now_us / half_period_us) % 2LL) == 0LL;
+    }
+    snprintf(text, 8, "%c%c:%c%c", digits[0], digits[1], digits[2], digits[3]);
+    *time_valid = true;
+    *separator_on = separator;
+}
+
+static esp_err_t clock_4x4094_apply_state_locked(output_runtime_t *out, int64_t now_us, bool force_render)
+{
+    char digits[4] = {' ', ' ', ' ', ' '};
+    char text[8] = {0};
+    bool time_valid = false;
+    bool separator_on = false;
+    uint8_t frame[4] = {0};
+    bool frame_changed = false;
+    bool status_changed = false;
+
+    if (!out || out->type != OUTPUT_TYPE_CLOCK_4X4094) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    clock_4x4094_build_display_locked(out, now_us, digits, text, &time_valid, &separator_on);
+
+    for (int i = 0; i < 4; ++i) {
+        int src_index = out->cfg.clock_4x4094.reverse_digits ? (3 - i) : i;
+        bool dot = separator_on && i == 2;
+        frame[i] = clock_4x4094_encode_char(digits[src_index], dot);
+        if (out->cfg.clock_4x4094.mirror_segments) {
+            frame[i] = clock_4x4094_mirror_segments(frame[i]);
+        }
+        frame[i] = clock_4x4094_remap_segments(frame[i], out->cfg.clock_4x4094.segment_map);
+        if (out->cfg.clock_4x4094.common_anode) {
+            frame[i] = (uint8_t)~frame[i];
+        }
+        if (frame[i] != out->cfg.clock_4x4094.segments[i]) {
+            frame_changed = true;
+        }
+    }
+
+    status_changed = force_render ||
+                     frame_changed ||
+                     out->cfg.clock_4x4094.time_valid != time_valid ||
+                     out->cfg.clock_4x4094.separator_on != separator_on ||
+                     strcmp(out->cfg.clock_4x4094.display_text, text) != 0;
+
+    if (frame_changed || force_render) {
+        (void)gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_c, 0);
+        // Bytes are shifted from the furthest register to the nearest one.
+        for (int i = 3; i >= 0; --i) {
+            clock_4x4094_shift_byte_locked(out, frame[i]);
+        }
+        (void)gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_c, 1);
+        esp_rom_delay_us(1);
+        (void)gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_c, 0);
+        memcpy(out->cfg.clock_4x4094.segments, frame, sizeof(frame));
+    }
+
+    out->cfg.clock_4x4094.time_valid = time_valid;
+    out->cfg.clock_4x4094.separator_on = separator_on;
+    snprintf(out->cfg.clock_4x4094.display_text, sizeof(out->cfg.clock_4x4094.display_text), "%s", text);
+    if (time_valid && out->power) {
+        time_t shifted = time(NULL) + ((time_t)out->cfg.clock_4x4094.timezone_offset_min * 60);
+        struct tm tm_now = {0};
+        gmtime_r(&shifted, &tm_now);
+        out->cfg.clock_4x4094.display_hour = tm_now.tm_hour;
+        out->cfg.clock_4x4094.display_minute = tm_now.tm_min;
+    } else {
+        out->cfg.clock_4x4094.display_hour = -1;
+        out->cfg.clock_4x4094.display_minute = -1;
+    }
+    out->cfg.clock_4x4094.last_render_us = now_us;
+
+    return status_changed ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+static bool update_clock_4x4094_locked(output_runtime_t *out, int64_t now_us)
+{
+    esp_err_t err = clock_4x4094_apply_state_locked(out, now_us, false);
+    return err == ESP_OK;
+}
+
+static esp_err_t clock_4x4094_apply_brightness_locked(output_runtime_t *out)
+{
+    uint32_t duty = 0;
+    const uint32_t max_duty = (1U << LEDC_TIMER_13_BIT) - 1U;
+    int requested = 0;
+
+    if (!out || out->type != OUTPUT_TYPE_CLOCK_4X4094) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (out->cfg.clock_4x4094.brightness_gpio < 0) {
+        return ESP_OK;
+    }
+
+    requested = out->power ? out->cfg.clock_4x4094.level : 0;
+    if (requested < 0) {
+        requested = 0;
+    }
+    if (requested > 100) {
+        requested = 100;
+    }
+
+    duty = (uint32_t)((requested * (int)max_duty) / 100);
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, out->cfg.clock_4x4094.channel, duty));
+    return ledc_update_duty(LEDC_LOW_SPEED_MODE, out->cfg.clock_4x4094.channel);
 }
 
 static esp_err_t set_pwm_power_relay_locked(output_runtime_t *out, bool on)
@@ -1749,6 +2034,14 @@ static esp_err_t output_apply_physical_state(output_runtime_t *out)
         }
         case OUTPUT_TYPE_SERVO_5WIRE:
             return servo_5wire_set_drive_locked(out, 0);
+        case OUTPUT_TYPE_CLOCK_4X4094: {
+            esp_err_t brightness_err = clock_4x4094_apply_brightness_locked(out);
+            esp_err_t err = clock_4x4094_apply_state_locked(out, esp_timer_get_time(), true);
+            if (brightness_err != ESP_OK) {
+                return brightness_err;
+            }
+            return (err == ESP_ERR_NO_MEM) ? ESP_OK : err;
+        }
         default:
             return ESP_ERR_INVALID_ARG;
     }
@@ -1785,6 +2078,10 @@ static esp_err_t set_output_level_locked(output_runtime_t *out, int level)
         out->cfg.servo_5wire.target_level = level;
         out->cfg.servo_5wire.timed_out = false;
         out->power = out->cfg.servo_5wire.moving;
+    } else if (out->type == OUTPUT_TYPE_CLOCK_4X4094) {
+        out->cfg.clock_4x4094.level = level;
+        out->power = (level > 0);
+        return output_apply_physical_state(out);
     } else if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
         out->cfg.stepper_28byj.homing = false;
         out->cfg.stepper_28byj.target_level = level;
@@ -1880,6 +2177,9 @@ static esp_err_t start_output_test_locked(output_runtime_t *out, int duration_ms
             case OUTPUT_TYPE_SERVO_5WIRE:
                 out->test_restore_level = out->cfg.servo_5wire.target_level;
                 break;
+            case OUTPUT_TYPE_CLOCK_4X4094:
+                out->test_restore_level = out->cfg.clock_4x4094.level;
+                break;
             case OUTPUT_TYPE_STEPPER_28BYJ:
                 out->test_restore_level = out->cfg.stepper_28byj.target_level;
                 break;
@@ -1921,6 +2221,10 @@ static esp_err_t start_output_test_locked(output_runtime_t *out, int duration_ms
             out->cfg.servo_5wire.timed_out = false;
             (void)update_servo_5wire_control_locked(out, esp_timer_get_time());
             return ESP_OK;
+        case OUTPUT_TYPE_CLOCK_4X4094:
+            out->power = true;
+            out->cfg.clock_4x4094.level = 100;
+            return output_apply_physical_state(out);
         case OUTPUT_TYPE_STEPPER_28BYJ:
             test_level = out->cfg.stepper_28byj.current_level > 50 ? 0 : 100;
             return set_output_level_locked(out, test_level);
@@ -1978,6 +2282,11 @@ static bool process_output_test_locked(output_runtime_t *out, int64_t now_us)
             (void)update_servo_5wire_control_locked(out, now_us);
             err = ESP_OK;
             break;
+        case OUTPUT_TYPE_CLOCK_4X4094:
+            out->power = out->test_restore_power;
+            out->cfg.clock_4x4094.level = out->test_restore_level;
+            err = output_apply_physical_state(out);
+            break;
         case OUTPUT_TYPE_STEPPER_28BYJ:
         case OUTPUT_TYPE_STEPPER_A4988:
             err = set_output_level_locked(out, out->test_restore_level);
@@ -2018,6 +2327,18 @@ static void clear_runtime_locked(void)
         if (out->type == OUTPUT_TYPE_SERVO_5WIRE && out->cfg.servo_5wire.gpio_b >= 0) {
             (void)servo_5wire_set_drive_locked(out, 0);
             gpio_reset_pin((gpio_num_t)out->cfg.servo_5wire.gpio_b);
+        }
+        if (out->type == OUTPUT_TYPE_CLOCK_4X4094) {
+            if (out->cfg.clock_4x4094.brightness_gpio >= 0) {
+                (void)ledc_stop(LEDC_LOW_SPEED_MODE, out->cfg.clock_4x4094.channel, 0);
+                gpio_reset_pin((gpio_num_t)out->cfg.clock_4x4094.brightness_gpio);
+            }
+            if (out->cfg.clock_4x4094.gpio_b >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.clock_4x4094.gpio_b);
+            }
+            if (out->cfg.clock_4x4094.gpio_c >= 0) {
+                gpio_reset_pin((gpio_num_t)out->cfg.clock_4x4094.gpio_c);
+            }
         }
         if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
             (void)stepper_28byj_release_locked(out);
@@ -2274,6 +2595,100 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         ESP_ERROR_CHECK(servo_5wire_set_drive_locked(out, 0));
         (void)update_servo_5wire_control_locked(out, esp_timer_get_time());
         return ESP_OK;
+    }
+
+    if (out->type == OUTPUT_TYPE_CLOCK_4X4094) {
+        out->cfg.clock_4x4094.gpio_b = jint(item, "gpio_b", -1);
+        out->cfg.clock_4x4094.gpio_c = jint(item, "gpio_c", -1);
+        out->cfg.clock_4x4094.brightness_gpio = jint(item, "brightness_gpio", -1);
+        out->cfg.clock_4x4094.segment_map[0] = (uint8_t)(jint(item, "segment_a", 1) - 1);
+        out->cfg.clock_4x4094.segment_map[1] = (uint8_t)(jint(item, "segment_b", 2) - 1);
+        out->cfg.clock_4x4094.segment_map[2] = (uint8_t)(jint(item, "segment_c", 3) - 1);
+        out->cfg.clock_4x4094.segment_map[3] = (uint8_t)(jint(item, "segment_d", 4) - 1);
+        out->cfg.clock_4x4094.segment_map[4] = (uint8_t)(jint(item, "segment_e", 5) - 1);
+        out->cfg.clock_4x4094.segment_map[5] = (uint8_t)(jint(item, "segment_f", 6) - 1);
+        out->cfg.clock_4x4094.segment_map[6] = (uint8_t)(jint(item, "segment_g", 7) - 1);
+        out->cfg.clock_4x4094.segment_map[7] = (uint8_t)(jint(item, "segment_dp", 8) - 1);
+        out->cfg.clock_4x4094.level = jint(item, "default_level", 100);
+        out->cfg.clock_4x4094.blink_period_ms = jint(item, "blink_period_ms", 2000);
+        out->cfg.clock_4x4094.timezone_offset_min = jint(item, "timezone_offset_min", 0);
+        out->cfg.clock_4x4094.default_on = jbool(item, "default_on", true);
+        out->cfg.clock_4x4094.common_anode = jbool(item, "common_anode", false);
+        out->cfg.clock_4x4094.mirror_segments = jbool(item, "mirror_segments", true);
+        out->cfg.clock_4x4094.reverse_digits = jbool(item, "reverse_digits", false);
+        out->cfg.clock_4x4094.leading_zero = jbool(item, "leading_zero", true);
+        out->cfg.clock_4x4094.blink_separator = jbool(item, "blink_separator", true);
+        out->cfg.clock_4x4094.channel = (ledc_channel_t)index;
+        out->cfg.clock_4x4094.timer = (ledc_timer_t)(index % 4);
+        out->cfg.clock_4x4094.time_valid = false;
+        out->cfg.clock_4x4094.separator_on = false;
+        out->cfg.clock_4x4094.display_hour = -1;
+        out->cfg.clock_4x4094.display_minute = -1;
+        out->cfg.clock_4x4094.last_render_us = 0;
+        memset(out->cfg.clock_4x4094.display_text, 0, sizeof(out->cfg.clock_4x4094.display_text));
+        memset(out->cfg.clock_4x4094.segments, 0, sizeof(out->cfg.clock_4x4094.segments));
+
+        if (out->cfg.clock_4x4094.timezone_offset_min < -720) {
+            out->cfg.clock_4x4094.timezone_offset_min = -720;
+        }
+        if (out->cfg.clock_4x4094.timezone_offset_min > 840) {
+            out->cfg.clock_4x4094.timezone_offset_min = 840;
+        }
+        if (out->cfg.clock_4x4094.level < 0) {
+            out->cfg.clock_4x4094.level = 0;
+        }
+        if (out->cfg.clock_4x4094.level > 100) {
+            out->cfg.clock_4x4094.level = 100;
+        }
+        if (out->cfg.clock_4x4094.blink_period_ms < 200) {
+            out->cfg.clock_4x4094.blink_period_ms = 200;
+        }
+        if (out->cfg.clock_4x4094.blink_period_ms > 10000) {
+            out->cfg.clock_4x4094.blink_period_ms = 10000;
+        }
+        for (int seg = 0; seg < 8; ++seg) {
+            if (out->cfg.clock_4x4094.segment_map[seg] > 7U) {
+                out->cfg.clock_4x4094.segment_map[seg] = (uint8_t)seg;
+            }
+        }
+        if (out->cfg.clock_4x4094.gpio_b < 0 || out->cfg.clock_4x4094.gpio_c < 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        gpio_config_t extra_io = {
+            .pin_bit_mask = (1ULL << out->cfg.clock_4x4094.gpio_b) |
+                            (1ULL << out->cfg.clock_4x4094.gpio_c),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&extra_io));
+        ESP_ERROR_CHECK(gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_b, 0));
+        ESP_ERROR_CHECK(gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_c, 0));
+        if (out->cfg.clock_4x4094.brightness_gpio >= 0) {
+            ledc_timer_config_t timer_cfg = {
+                .speed_mode = LEDC_LOW_SPEED_MODE,
+                .timer_num = out->cfg.clock_4x4094.timer,
+                .duty_resolution = LEDC_TIMER_13_BIT,
+                .freq_hz = 1000,
+                .clk_cfg = LEDC_AUTO_CLK,
+            };
+            ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+            ledc_channel_config_t chan_cfg = {
+                .gpio_num = out->cfg.clock_4x4094.brightness_gpio,
+                .speed_mode = LEDC_LOW_SPEED_MODE,
+                .channel = out->cfg.clock_4x4094.channel,
+                .intr_type = LEDC_INTR_DISABLE,
+                .timer_sel = out->cfg.clock_4x4094.timer,
+                .duty = 0,
+                .hpoint = 0,
+            };
+            ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
+        }
+        out->power = out->cfg.clock_4x4094.default_on && out->cfg.clock_4x4094.level > 0;
+        return output_apply_physical_state(out);
     }
 
     if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
@@ -2887,7 +3302,11 @@ static void modules_poll_task(void *arg)
             if (!out->used || !out->enabled) {
                 continue;
             }
-            if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
+            if (out->type == OUTPUT_TYPE_CLOCK_4X4094) {
+                if (update_clock_4x4094_locked(out, now_us)) {
+                    changed = true;
+                }
+            } else if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
                 if (update_stepper_28byj_control_locked(out, now_us)) {
                     changed = true;
                 }
@@ -3085,6 +3504,37 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
         cJSON_AddBoolToObject(obj, "reverse_direction", out->cfg.servo_5wire.reverse_direction);
         cJSON_AddBoolToObject(obj, "moving", out->cfg.servo_5wire.moving);
         cJSON_AddBoolToObject(obj, "timed_out", out->cfg.servo_5wire.timed_out);
+    } else if (out->type == OUTPUT_TYPE_CLOCK_4X4094) {
+        cJSON_AddNumberToObject(obj, "level", out->cfg.clock_4x4094.level);
+        cJSON_AddNumberToObject(obj, "brightness", (out->cfg.clock_4x4094.level * 255) / 100);
+        cJSON_AddNumberToObject(obj, "gpio_b", out->cfg.clock_4x4094.gpio_b);
+        cJSON_AddNumberToObject(obj, "gpio_c", out->cfg.clock_4x4094.gpio_c);
+        if (out->cfg.clock_4x4094.brightness_gpio >= 0) {
+            cJSON_AddNumberToObject(obj, "brightness_gpio", out->cfg.clock_4x4094.brightness_gpio);
+        }
+        cJSON_AddNumberToObject(obj, "timezone_offset_min", out->cfg.clock_4x4094.timezone_offset_min);
+        cJSON_AddNumberToObject(obj, "blink_period_ms", out->cfg.clock_4x4094.blink_period_ms);
+        cJSON_AddBoolToObject(obj, "default_on", out->cfg.clock_4x4094.default_on);
+        cJSON_AddBoolToObject(obj, "common_anode", out->cfg.clock_4x4094.common_anode);
+        cJSON_AddBoolToObject(obj, "mirror_segments", out->cfg.clock_4x4094.mirror_segments);
+        cJSON_AddBoolToObject(obj, "reverse_digits", out->cfg.clock_4x4094.reverse_digits);
+        cJSON_AddBoolToObject(obj, "leading_zero", out->cfg.clock_4x4094.leading_zero);
+        cJSON_AddBoolToObject(obj, "blink_separator", out->cfg.clock_4x4094.blink_separator);
+        cJSON_AddNumberToObject(obj, "segment_a", out->cfg.clock_4x4094.segment_map[0] + 1);
+        cJSON_AddNumberToObject(obj, "segment_b", out->cfg.clock_4x4094.segment_map[1] + 1);
+        cJSON_AddNumberToObject(obj, "segment_c", out->cfg.clock_4x4094.segment_map[2] + 1);
+        cJSON_AddNumberToObject(obj, "segment_d", out->cfg.clock_4x4094.segment_map[3] + 1);
+        cJSON_AddNumberToObject(obj, "segment_e", out->cfg.clock_4x4094.segment_map[4] + 1);
+        cJSON_AddNumberToObject(obj, "segment_f", out->cfg.clock_4x4094.segment_map[5] + 1);
+        cJSON_AddNumberToObject(obj, "segment_g", out->cfg.clock_4x4094.segment_map[6] + 1);
+        cJSON_AddNumberToObject(obj, "segment_dp", out->cfg.clock_4x4094.segment_map[7] + 1);
+        cJSON_AddBoolToObject(obj, "time_valid", out->cfg.clock_4x4094.time_valid);
+        cJSON_AddBoolToObject(obj, "separator_on", out->cfg.clock_4x4094.separator_on);
+        cJSON_AddStringToObject(obj, "display_text", out->cfg.clock_4x4094.display_text);
+        if (out->cfg.clock_4x4094.display_hour >= 0) {
+            cJSON_AddNumberToObject(obj, "display_hour", out->cfg.clock_4x4094.display_hour);
+            cJSON_AddNumberToObject(obj, "display_minute", out->cfg.clock_4x4094.display_minute);
+        }
     } else if (out->type == OUTPUT_TYPE_STEPPER_28BYJ) {
         cJSON_AddNumberToObject(obj, "level", out->cfg.stepper_28byj.current_level);
         cJSON_AddNumberToObject(obj, "target_level", out->cfg.stepper_28byj.target_level);

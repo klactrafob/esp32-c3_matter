@@ -567,6 +567,7 @@ static cJSON *normalize_config(const cJSON *src)
                 strcmp(type, "ws2812") != 0 &&
                 strcmp(type, "servo_3wire") != 0 &&
                 strcmp(type, "servo_5wire") != 0 &&
+                strcmp(type, "clock_4x4094") != 0 &&
                 strcmp(type, "stepper_28byj") != 0 &&
                 strcmp(type, "stepper_a4988") != 0) {
                 set_error("Output %s uses unsupported type '%s'", id, type);
@@ -735,6 +736,95 @@ static cJSON *normalize_config(const cJSON *src)
                 cJSON_AddNumberToObject(dst, "deadband_pct", deadband_pct);
                 cJSON_AddNumberToObject(dst, "move_timeout_ms", move_timeout_ms);
                 cJSON_AddBoolToObject(dst, "reverse_direction", jbool(item, "reverse_direction", false));
+            } else if (strcmp(type, "clock_4x4094") == 0) {
+                int gpio_b = jint(item, "gpio_b", -1);
+                int gpio_c = jint(item, "gpio_c", -1);
+                int brightness_gpio = jint(item, "brightness_gpio", -1);
+                int default_level = jint(item, "default_level", 100);
+                int blink_period_ms = jint(item, "blink_period_ms", 2000);
+                int timezone_offset_min = jint(item, "timezone_offset_min", 0);
+                int segment_map[8] = {
+                    jint(item, "segment_a", 1),
+                    jint(item, "segment_b", 2),
+                    jint(item, "segment_c", 3),
+                    jint(item, "segment_d", 4),
+                    jint(item, "segment_e", 5),
+                    jint(item, "segment_f", 6),
+                    jint(item, "segment_g", 7),
+                    jint(item, "segment_dp", 8),
+                };
+                bool segment_seen[8] = {false};
+                bool segment_map_valid = true;
+
+                char owner_b[40] = {0};
+                char owner_c[40] = {0};
+                char owner_pwm[40] = {0};
+                snprintf(owner_b, sizeof(owner_b), "clock4094-clk:%s", id);
+                snprintf(owner_c, sizeof(owner_c), "clock4094-latch:%s", id);
+                snprintf(owner_pwm, sizeof(owner_pwm), "clk4094-br:%s", id);
+
+                if (!reserve_gpio(ctx, gpio_b, owner_b, "") ||
+                    !reserve_gpio(ctx, gpio_c, owner_c, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+                if (brightness_gpio >= 0 && !reserve_gpio(ctx, brightness_gpio, owner_pwm, "")) {
+                    return normalize_cleanup_and_fail(root, ctx);
+                }
+
+                if (timezone_offset_min < -720) {
+                    timezone_offset_min = -720;
+                }
+                if (timezone_offset_min > 840) {
+                    timezone_offset_min = 840;
+                }
+                if (default_level < 0) {
+                    default_level = 0;
+                }
+                if (default_level > 100) {
+                    default_level = 100;
+                }
+                if (blink_period_ms < 200) {
+                    blink_period_ms = 200;
+                }
+                if (blink_period_ms > 10000) {
+                    blink_period_ms = 10000;
+                }
+                for (int seg = 0; seg < 8; ++seg) {
+                    if (segment_map[seg] < 1 || segment_map[seg] > 8 ||
+                        segment_seen[segment_map[seg] - 1]) {
+                        segment_map_valid = false;
+                        break;
+                    }
+                    segment_seen[segment_map[seg] - 1] = true;
+                }
+                if (!segment_map_valid) {
+                    for (int seg = 0; seg < 8; ++seg) {
+                        segment_map[seg] = seg + 1;
+                    }
+                }
+
+                cJSON_AddNumberToObject(dst, "gpio_b", gpio_b);
+                cJSON_AddNumberToObject(dst, "gpio_c", gpio_c);
+                if (brightness_gpio >= 0) {
+                    cJSON_AddNumberToObject(dst, "brightness_gpio", brightness_gpio);
+                }
+                cJSON_AddBoolToObject(dst, "default_on", jbool(item, "default_on", true));
+                cJSON_AddNumberToObject(dst, "default_level", default_level);
+                cJSON_AddNumberToObject(dst, "blink_period_ms", blink_period_ms);
+                cJSON_AddNumberToObject(dst, "timezone_offset_min", timezone_offset_min);
+                cJSON_AddBoolToObject(dst, "common_anode", jbool(item, "common_anode", false));
+                cJSON_AddBoolToObject(dst, "mirror_segments", jbool(item, "mirror_segments", true));
+                cJSON_AddBoolToObject(dst, "reverse_digits", jbool(item, "reverse_digits", false));
+                cJSON_AddBoolToObject(dst, "leading_zero", jbool(item, "leading_zero", true));
+                cJSON_AddBoolToObject(dst, "blink_separator", jbool(item, "blink_separator", true));
+                cJSON_AddNumberToObject(dst, "segment_a", segment_map[0]);
+                cJSON_AddNumberToObject(dst, "segment_b", segment_map[1]);
+                cJSON_AddNumberToObject(dst, "segment_c", segment_map[2]);
+                cJSON_AddNumberToObject(dst, "segment_d", segment_map[3]);
+                cJSON_AddNumberToObject(dst, "segment_e", segment_map[4]);
+                cJSON_AddNumberToObject(dst, "segment_f", segment_map[5]);
+                cJSON_AddNumberToObject(dst, "segment_g", segment_map[6]);
+                cJSON_AddNumberToObject(dst, "segment_dp", segment_map[7]);
             } else if (strcmp(type, "stepper_28byj") == 0) {
                 int gpio_b = jint(item, "gpio_b", -1);
                 int gpio_c = jint(item, "gpio_c", -1);

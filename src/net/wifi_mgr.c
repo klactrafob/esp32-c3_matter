@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "app_watchdog.h"
 #include "freertos/FreeRTOS.h"
@@ -9,6 +10,7 @@
 
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -35,6 +37,7 @@ static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
 static volatile bool s_ap_restore_pending = false;
 static cJSON *s_scan_cache = NULL;
+static bool s_sntp_started = false;
 
 static char s_ap_ssid[33] = {0};
 static wifi_config_t s_ap_cfg = {0};
@@ -46,12 +49,41 @@ static void ensure_default_wifi_netif_sta(void);
 static esp_err_t init_common_wifi(void);
 static esp_err_t start_ap_only(const char *ssid, const char *pass, const char *device_name);
 static esp_err_t start_sta_only(const char *sta_ssid, const char *sta_pass, const char *device_name);
+static void time_sync_notification_cb(struct timeval *tv);
+static void ensure_sntp_started(void);
 
 bool wifi_mgr_is_ap(void) { return s_is_ap; }
 const char *wifi_mgr_get_ap_ssid(void) { return s_ap_ssid; }
 bool wifi_mgr_sta_configured(void) { return s_sta_configured; }
 bool wifi_mgr_sta_has_ip(void) { return s_sta_has_ip; }
 int wifi_mgr_get_sta_rssi(void) { return s_sta_rssi; }
+
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    (void)tv;
+
+    time_t now = time(NULL);
+    struct tm tm_now = {0};
+    gmtime_r(&now, &tm_now);
+    system_log_writef("wifi", "info", "Time synced via NTP: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                      tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+                      tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+}
+
+static void ensure_sntp_started(void)
+{
+    if (s_sntp_started) {
+        return;
+    }
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.cloudflare.com");
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
+    s_sntp_started = true;
+    system_log_write("wifi", "info", "NTP sync started");
+}
 
 static void replace_scan_cache(const cJSON *arr)
 {
@@ -566,6 +598,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_sta_has_ip = true;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
         system_log_writef("wifi", "info", "STA got IP " IPSTR, IP2STR(&e->ip_info.ip));
+        ensure_sntp_started();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
         s_sta_has_ip = false;
         ESP_LOGW(TAG, "STA lost IP");

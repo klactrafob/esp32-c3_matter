@@ -433,7 +433,7 @@ static esp_err_t publish_discovery_entity(const mqtt_entity_t *entity)
     cJSON_AddStringToObject(root, "payload_not_available", "offline");
     cJSON_AddItemToObject(root, "device", build_device_obj());
 
-    if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "relay") == 0) {
+    if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->component, "switch") == 0) {
         cJSON_AddStringToObject(root, "command_topic", entity->command_topic);
         cJSON_AddStringToObject(root, "state_topic", entity->state_topic);
         cJSON_AddStringToObject(root, "payload_on", "ON");
@@ -563,7 +563,7 @@ static esp_err_t build_entity_state_payload(const mqtt_entity_t *entity, const c
     }
 
     payload[0] = 0;
-    if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "relay") == 0) {
+    if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->component, "switch") == 0) {
         bool power = jbool(status, "power", false);
         snprintf(payload, payload_len, "%s", power ? "ON" : "OFF");
     } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->component, "cover") == 0) {
@@ -580,9 +580,10 @@ static esp_err_t build_entity_state_payload(const mqtt_entity_t *entity, const c
                 strcmp(entity->type, "stepper_28byj") == 0 || strcmp(entity->type, "stepper_a4988") == 0)) {
         int level = jint(status, "level", 0);
         snprintf(payload, payload_len, "%d", level);
-    } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->type, "pwm") == 0) {
+    } else if (entity->kind == ENTITY_KIND_OUTPUT &&
+               (strcmp(entity->type, "pwm") == 0 || strcmp(entity->type, "clock_4x4094") == 0)) {
         bool power = jbool(status, "power", false);
-        int level = jint(status, "level", 0);
+        int level = jint(status, "level", strcmp(entity->type, "clock_4x4094") == 0 ? 100 : 0);
         int brightness = (level * 255) / 100;
         snprintf(payload, payload_len, "{\"state\":\"%s\",\"brightness\":%d}",
                  power ? "ON" : "OFF", brightness);
