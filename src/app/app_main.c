@@ -35,7 +35,11 @@ void app_main(void)
     ESP_ERROR_CHECK(app_watchdog_ensure_init());
     device_state_init();
     ESP_ERROR_CHECK(modules_init());
-    ESP_ERROR_CHECK(modules_apply_config(cfg_json_get()));
+    err = modules_apply_config(cfg_json_get());
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Module config apply failed: %s", esp_err_to_name(err));
+        system_log_writef("sys", "error", "Module config apply failed: %s", modules_last_error());
+    }
 
     ESP_ERROR_CHECK(reset_btn_start());
     ESP_ERROR_CHECK(wifi_mgr_start_from_cfg(cfg_json_get()));

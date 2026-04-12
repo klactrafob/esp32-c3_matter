@@ -21,6 +21,7 @@ static const char *TAG = "mqtt_mgr";
 #define MQTT_STATE_PAYLOAD_MAX 256
 #define MQTT_OUTPUT_THROTTLE_MS 250
 #define MQTT_FLUSH_TASK_PERIOD_MS 100
+#define MQTT_UNIT_CELSIUS "\xC2\xB0" "C"
 
 typedef enum {
     ENTITY_KIND_NONE = 0,
@@ -95,6 +96,13 @@ static bool topic_matches(const char *expected, const char *topic, int topic_len
 static bool entity_uses_position_topic(const mqtt_entity_t *entity, const char *topic, int topic_len);
 static esp_err_t apply_cover_command(const mqtt_entity_t *entity, const char *data, int len,
                                      bool position_topic);
+static const char *normalize_output_component_override(const char *value);
+static const char *normalize_output_number_mode(const char *value);
+static const char *resolve_output_component(const cJSON *item);
+static bool output_type_supports_cover(const char *type);
+static esp_err_t clear_discovery_topic(const char *component, const char *id);
+static bool entity_exists(entity_kind_t kind, const char *id);
+static bool sync_entities_from_status(const cJSON *status);
 
 static const cJSON *jobj(const cJSON *obj, const char *key)
 {
@@ -129,6 +137,79 @@ static int jint(const cJSON *obj, const char *key, int def)
         return it->valueint;
     }
     return def;
+}
+
+static const char *normalize_output_component_override(const char *value)
+{
+    if (value && strcmp(value, "number") == 0) {
+        return "number";
+    }
+    if (value && strcmp(value, "light") == 0) {
+        return "light";
+    }
+    if (value && strcmp(value, "cover") == 0) {
+        return "cover";
+    }
+    return "auto";
+}
+
+static const char *normalize_output_number_mode(const char *value)
+{
+    if (value && strcmp(value, "box") == 0) {
+        return "box";
+    }
+    if (value && strcmp(value, "auto") == 0) {
+        return "auto";
+    }
+    return "slider";
+}
+
+static bool output_type_supports_cover(const char *type)
+{
+    return type &&
+           (strcmp(type, "servo_3wire") == 0 ||
+            strcmp(type, "servo_5wire") == 0 ||
+            strcmp(type, "stepper_28byj") == 0 ||
+            strcmp(type, "stepper_a4988") == 0);
+}
+
+static bool output_type_supports_light_override(const char *type)
+{
+    return type &&
+           (strcmp(type, "servo_3wire") == 0 ||
+            strcmp(type, "servo_5wire") == 0);
+}
+
+static const char *resolve_output_component(const cJSON *item)
+{
+    const char *type = jstr(item, "type", "");
+    const char *role = jstr(item, "role", "");
+    const char *override = normalize_output_component_override(jstr(item, "mqtt_component", "auto"));
+
+    if (strcmp(override, "light") == 0 && output_type_supports_light_override(type)) {
+        return "light";
+    }
+    if (strcmp(override, "cover") == 0 && output_type_supports_cover(type)) {
+        return "cover";
+    }
+    if (strcmp(override, "number") == 0 &&
+        (strcmp(type, "servo_3wire") == 0 || strcmp(type, "servo_5wire") == 0 ||
+         strcmp(type, "stepper_28byj") == 0 || strcmp(type, "stepper_a4988") == 0)) {
+        return "number";
+    }
+
+    if (strcmp(type, "relay") == 0) {
+        return "switch";
+    }
+    if ((strcmp(type, "stepper_28byj") == 0 || strcmp(type, "stepper_a4988") == 0) &&
+        strcmp(role, "cover") == 0) {
+        return "cover";
+    }
+    if (strcmp(type, "servo_3wire") == 0 || strcmp(type, "servo_5wire") == 0 ||
+        strcmp(type, "stepper_28byj") == 0 || strcmp(type, "stepper_a4988") == 0) {
+        return "number";
+    }
+    return "light";
 }
 
 static void copy_str(char *dst, size_t len, const char *src)
@@ -171,6 +252,19 @@ static esp_err_t publish_raw(const char *topic, const char *payload, int qos, bo
     }
     int msg_id = esp_mqtt_client_publish(s_client, topic, payload, 0, qos, retain ? 1 : 0);
     return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t clear_discovery_topic(const char *component, const char *id)
+{
+    char topic[192];
+
+    if (!component || !component[0] || !id || !id[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    snprintf(topic, sizeof(topic), "%s/%s/%s/%s/config",
+             s_cfg.discovery_prefix, component, s_cfg.node_id, id);
+    return publish_raw(topic, "", 1, true);
 }
 
 static int entity_publish_throttle_ms(const mqtt_entity_t *entity)
@@ -269,6 +363,22 @@ static bool add_entity(entity_kind_t kind, const char *component, const char *id
     return true;
 }
 
+static bool entity_exists(entity_kind_t kind, const char *id)
+{
+    if (!id || !id[0]) {
+        return false;
+    }
+    for (int i = 0; i < s_entity_count; ++i) {
+        if (!s_entities[i].used || s_entities[i].kind != kind) {
+            continue;
+        }
+        if (strcmp(s_entities[i].id, id) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static esp_err_t parse_cfg(const cJSON *cfg, mqtt_cfg_t *out)
 {
     if (!cfg || !out) {
@@ -326,19 +436,16 @@ static void build_entities_from_status(const cJSON *status)
             }
             const char *type = jstr(item, "type", "");
             const char *role = jstr(item, "role", "");
-            const char *component = "light";
-            if (strcmp(type, "relay") == 0) {
-                component = "switch";
-            } else if ((strcmp(type, "stepper_28byj") == 0 || strcmp(type, "stepper_a4988") == 0) &&
-                       strcmp(role, "cover") == 0) {
-                component = "cover";
-            } else if (strcmp(type, "servo_3wire") == 0 || strcmp(type, "servo_5wire") == 0 ||
-                       strcmp(type, "stepper_28byj") == 0 || strcmp(type, "stepper_a4988") == 0) {
-                component = "number";
+            const char *component = resolve_output_component(item);
+            const char *output_mode = "";
+            if (strcmp(component, "number") == 0) {
+                output_mode = normalize_output_number_mode(jstr(item, "mqtt_number_mode", "slider"));
+            } else if (strcmp(type, "ws2812") == 0) {
+                output_mode = jstr(item, "mode", "");
             }
             add_entity(ENTITY_KIND_OUTPUT, component, jstr(item, "id", ""),
                        jstr(item, "name", ""), type, role, jstr(item, "id", ""), "", true,
-                       jstr(item, "mode", ""));
+                       output_mode);
         }
     }
 
@@ -406,6 +513,77 @@ static void build_entities_from_status(const cJSON *status)
     }
 }
 
+static bool sync_entities_from_status(const cJSON *status)
+{
+    bool added = false;
+    const cJSON *sensors = jobj(status, "sensors");
+
+    if (!cJSON_IsArray((cJSON *)sensors)) {
+        return false;
+    }
+
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, (cJSON *)sensors) {
+        if (!jbool(item, "enabled", true) || !jbool(item, "supported", false)) {
+            continue;
+        }
+
+        const char *type = jstr(item, "type", "");
+        const char *sid = jstr(item, "id", "");
+        const char *name = jstr(item, "name", sid);
+
+        if (strcmp(type, "aht20") == 0 || strcmp(type, "sht3x") == 0 || strcmp(type, "bme280") == 0) {
+            char id_temp[40] = {0};
+            char id_hum[40] = {0};
+            char name_temp[64] = {0};
+            char name_hum[64] = {0};
+            snprintf(id_temp, sizeof(id_temp), "%s_temperature", sid);
+            snprintf(id_hum, sizeof(id_hum), "%s_humidity", sid);
+            snprintf(name_temp, sizeof(name_temp), "%s Temperature", name);
+            snprintf(name_hum, sizeof(name_hum), "%s Humidity", name);
+            if (!entity_exists(ENTITY_KIND_SENSOR, id_temp) &&
+                add_entity(ENTITY_KIND_SENSOR, "sensor", id_temp, name_temp, type, "temperature",
+                           sid, "temperature_c", false, "")) {
+                added = true;
+            }
+            if (!entity_exists(ENTITY_KIND_SENSOR, id_hum) &&
+                add_entity(ENTITY_KIND_SENSOR, "sensor", id_hum, name_hum, type, "humidity",
+                           sid, "humidity_pct", false, "")) {
+                added = true;
+            }
+            if (strcmp(type, "bme280") == 0) {
+                char id_pressure[40] = {0};
+                char name_pressure[64] = {0};
+                snprintf(id_pressure, sizeof(id_pressure), "%s_pressure", sid);
+                snprintf(name_pressure, sizeof(name_pressure), "%s Pressure", name);
+                if (!entity_exists(ENTITY_KIND_SENSOR, id_pressure) &&
+                    add_entity(ENTITY_KIND_SENSOR, "sensor", id_pressure, name_pressure, type, "pressure",
+                               sid, "pressure_hpa", false, "")) {
+                    added = true;
+                }
+            }
+        } else if (strcmp(type, "ds18b20_bus") == 0) {
+            const cJSON *devices = jobj(item, "devices");
+            if (!cJSON_IsArray((cJSON *)devices)) {
+                continue;
+            }
+            cJSON *dev = NULL;
+            cJSON_ArrayForEach(dev, (cJSON *)devices) {
+                const char *dev_id = jstr(dev, "id", "");
+                char entity_name[72] = {0};
+                snprintf(entity_name, sizeof(entity_name), "%s Temperature", jstr(dev, "name", "DS18B20"));
+                if (!entity_exists(ENTITY_KIND_SENSOR, dev_id) &&
+                    add_entity(ENTITY_KIND_SENSOR, "sensor", dev_id, entity_name, "ds18b20", "temperature",
+                               dev_id, "temperature_c", false, "")) {
+                    added = true;
+                }
+            }
+        }
+    }
+
+    return added;
+}
+
 static cJSON *build_device_obj(void)
 {
     cJSON *dev = cJSON_CreateObject();
@@ -450,15 +628,16 @@ static esp_err_t publish_discovery_entity(const mqtt_entity_t *entity)
         cJSON_AddStringToObject(root, "payload_close", "CLOSE");
         cJSON_AddStringToObject(root, "payload_stop", "STOP");
         cJSON_AddBoolToObject(root, "retain", s_cfg.retain);
-    } else if (entity->kind == ENTITY_KIND_OUTPUT &&
-               (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0 ||
-                strcmp(entity->type, "stepper_28byj") == 0 || strcmp(entity->type, "stepper_a4988") == 0)) {
+    } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->component, "number") == 0) {
         cJSON_AddStringToObject(root, "command_topic", entity->command_topic);
         cJSON_AddStringToObject(root, "state_topic", entity->state_topic);
         cJSON_AddNumberToObject(root, "min", 0);
         cJSON_AddNumberToObject(root, "max", 100);
         cJSON_AddNumberToObject(root, "step", 1);
-        cJSON_AddStringToObject(root, "mode", "slider");
+        if (strcmp(entity->output_mode, "auto") != 0) {
+            cJSON_AddStringToObject(root, "mode",
+                                    entity->output_mode[0] ? entity->output_mode : "slider");
+        }
         cJSON_AddStringToObject(root, "unit_of_measurement", "%");
     } else if (entity->kind == ENTITY_KIND_OUTPUT) {
         cJSON_AddStringToObject(root, "schema", "json");
@@ -489,7 +668,7 @@ static esp_err_t publish_discovery_entity(const mqtt_entity_t *entity)
         cJSON_AddStringToObject(root, "state_class", "measurement");
         if (strcmp(entity->role, "temperature") == 0) {
             cJSON_AddStringToObject(root, "device_class", "temperature");
-            cJSON_AddStringToObject(root, "unit_of_measurement", "C");
+            cJSON_AddStringToObject(root, "unit_of_measurement", MQTT_UNIT_CELSIUS);
         } else if (strcmp(entity->role, "humidity") == 0) {
             cJSON_AddStringToObject(root, "device_class", "humidity");
             cJSON_AddStringToObject(root, "unit_of_measurement", "%");
@@ -507,6 +686,17 @@ static esp_err_t publish_discovery_entity(const mqtt_entity_t *entity)
 
     esp_err_t err = publish_raw(entity->config_topic, payload, 1, true);
     free(payload);
+    if (err == ESP_OK && entity->kind == ENTITY_KIND_OUTPUT) {
+        if (strcmp(entity->component, "number") != 0) {
+            (void)clear_discovery_topic("number", entity->id);
+        }
+        if (strcmp(entity->component, "cover") != 0 && output_type_supports_cover(entity->type)) {
+            (void)clear_discovery_topic("cover", entity->id);
+        }
+        if (strcmp(entity->component, "light") != 0 && output_type_supports_light_override(entity->type)) {
+            (void)clear_discovery_topic("light", entity->id);
+        }
+    }
     return err;
 }
 
@@ -575,11 +765,15 @@ static esp_err_t build_entity_state_payload(const mqtt_entity_t *entity, const c
         }
         snprintf(payload, payload_len, "{\"state\":\"%s\",\"position\":%d,\"cover_state\":\"%s\"}",
                  mqtt_state, position, cover_state);
-    } else if (entity->kind == ENTITY_KIND_OUTPUT &&
-               (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0 ||
-                strcmp(entity->type, "stepper_28byj") == 0 || strcmp(entity->type, "stepper_a4988") == 0)) {
+    } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->component, "number") == 0) {
         int level = jint(status, "level", 0);
         snprintf(payload, payload_len, "%d", level);
+    } else if (entity->kind == ENTITY_KIND_OUTPUT && strcmp(entity->component, "light") == 0 &&
+               (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0)) {
+        int level = jint(status, "level", 0);
+        int brightness = (level * 255) / 100;
+        snprintf(payload, payload_len, "{\"state\":\"%s\",\"brightness\":%d}",
+                 level > 0 ? "ON" : "OFF", brightness);
     } else if (entity->kind == ENTITY_KIND_OUTPUT &&
                (strcmp(entity->type, "pwm") == 0 || strcmp(entity->type, "clock_4x4094") == 0)) {
         bool power = jbool(status, "power", false);
@@ -751,10 +945,38 @@ static esp_err_t publish_all_states(void)
     return publish_state_snapshot(true, false);
 }
 
+static int current_output_level(const mqtt_entity_t *entity)
+{
+    cJSON *status = NULL;
+    const cJSON *outputs = NULL;
+    const cJSON *item = NULL;
+    int level = -1;
+
+    if (!entity || !entity->id[0]) {
+        return -1;
+    }
+
+    status = modules_build_status_json();
+    if (!status) {
+        return -1;
+    }
+
+    outputs = jobj(status, "outputs");
+    item = find_status_item(outputs, entity->id);
+    if (item) {
+        level = jint(item, "level", -1);
+    }
+    cJSON_Delete(status);
+    return level;
+}
+
 static esp_err_t apply_light_command(const mqtt_entity_t *entity, const char *data, int len)
 {
     char buf[256] = {0};
     int copy_len = (len < (int)sizeof(buf) - 1) ? len : (int)sizeof(buf) - 1;
+    bool servo_light = entity && strcmp(entity->component, "light") == 0 &&
+                       (strcmp(entity->type, "servo_3wire") == 0 || strcmp(entity->type, "servo_5wire") == 0);
+    int current_level = servo_light ? current_output_level(entity) : -1;
     memcpy(buf, data, (size_t)copy_len);
 
     cJSON *root = NULL;
@@ -773,15 +995,24 @@ static esp_err_t apply_light_command(const mqtt_entity_t *entity, const char *da
         const cJSON *state = cJSON_GetObjectItemCaseSensitive(root, "state");
         if (cJSON_IsString(state) && state->valuestring) {
             if (str_ieq(state->valuestring, "ON")) {
-                cJSON_AddBoolToObject(action, "set", true);
+                if (servo_light) {
+                    cJSON_AddNumberToObject(action, "set_level", current_level > 0 ? current_level : 100);
+                } else {
+                    cJSON_AddBoolToObject(action, "set", true);
+                }
             } else if (str_ieq(state->valuestring, "OFF")) {
-                cJSON_AddBoolToObject(action, "set", false);
+                if (servo_light) {
+                    cJSON_AddNumberToObject(action, "set_level", 0);
+                } else {
+                    cJSON_AddBoolToObject(action, "set", false);
+                }
             }
         }
 
         const cJSON *brightness = cJSON_GetObjectItemCaseSensitive(root, "brightness");
         if (cJSON_IsNumber(brightness)) {
             cJSON_DeleteItemFromObjectCaseSensitive(action, "set");
+            cJSON_DeleteItemFromObjectCaseSensitive(action, "set_level");
             if (strcmp(entity->type, "ws2812") == 0) {
                 cJSON_AddNumberToObject(action, "set_brightness", brightness->valueint);
             } else {
@@ -796,11 +1027,23 @@ static esp_err_t apply_light_command(const mqtt_entity_t *entity, const char *da
         }
     } else {
         if (str_ieq(buf, "ON")) {
-            cJSON_AddBoolToObject(action, "set", true);
+            if (servo_light) {
+                cJSON_AddNumberToObject(action, "set_level", current_level > 0 ? current_level : 100);
+            } else {
+                cJSON_AddBoolToObject(action, "set", true);
+            }
         } else if (str_ieq(buf, "OFF")) {
-            cJSON_AddBoolToObject(action, "set", false);
+            if (servo_light) {
+                cJSON_AddNumberToObject(action, "set_level", 0);
+            } else {
+                cJSON_AddBoolToObject(action, "set", false);
+            }
         } else if (str_ieq(buf, "TOGGLE")) {
-            cJSON_AddBoolToObject(action, "toggle", true);
+            if (servo_light) {
+                cJSON_AddNumberToObject(action, "set_level", current_level > 0 ? 0 : 100);
+            } else {
+                cJSON_AddBoolToObject(action, "toggle", true);
+            }
         }
     }
 
@@ -984,6 +1227,8 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
             }
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "MQTT command for %s failed: %s", entity->id, esp_err_to_name(err));
+                system_log_writef("mqtt", "warn", "Command for %s failed: %s",
+                                  entity->id, esp_err_to_name(err));
             }
             break;
         }
@@ -1032,6 +1277,24 @@ esp_err_t mqtt_mgr_notify_runtime_changed(void)
 {
     if (!s_cfg.enabled || !s_connected) {
         return ESP_OK;
+    }
+    cJSON *status = modules_build_status_json();
+    if (!status) {
+        return ESP_ERR_NO_MEM;
+    }
+    bool added = sync_entities_from_status(status);
+    cJSON_Delete(status);
+    if (added) {
+        for (int i = 0; i < s_entity_count; ++i) {
+            if (s_entities[i].supports_command) {
+                (void)esp_mqtt_client_subscribe(s_client, s_entities[i].command_topic, 1);
+                if (s_entities[i].set_position_topic[0] != 0) {
+                    (void)esp_mqtt_client_subscribe(s_client, s_entities[i].set_position_topic, 1);
+                }
+            }
+            (void)publish_discovery_entity(&s_entities[i]);
+        }
+        return publish_all_states();
     }
     return publish_state_snapshot(false, true);
 }

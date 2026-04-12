@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "nvs.h"
+#include "soc/soc_caps.h"
 
 static const char *TAG = "cfg_json";
 static const char *NVS_NS = "cfg";
@@ -18,6 +19,7 @@ static const char *NVS_KEY = "json";
 #define CFG_MAX_OUTPUTS 8
 #define CFG_MAX_INPUTS_AND_BUTTONS 8
 #define CFG_MAX_SENSORS 4
+#define SERVO_3WIRE_HOLD_MS_DEFAULT 1200
 
 static const int s_conservative_board_gpios[] = {0, 1, 3, 4, 5, 6, 7, 10};
 static const int s_luatos_board_gpios[] = {0, 1, 3, 4, 5, 6, 7, 10, 12, 13};
@@ -56,6 +58,11 @@ typedef struct {
 } gpio_reservation_t;
 
 typedef struct {
+    bool used;
+    int freq_hz;
+} ledc_timer_reservation_t;
+
+typedef struct {
     gpio_reservation_t pins[32];
     char ids[32][24];
     int id_count;
@@ -66,6 +73,11 @@ typedef struct {
     int i2c_freq;
     bool onewire_seen;
     int onewire_gpio;
+    ledc_timer_reservation_t ledc_timers[SOC_LEDC_TIMER_NUM];
+    int ledc_timer_count;
+    int ledc_channel_count;
+    int rmt_tx_blocks_used;
+    int rmt_rx_blocks_used;
 } cfg_validation_t;
 
 static void set_error(const char *fmt, ...)
@@ -296,6 +308,31 @@ static const char *normalize_stepper_role(const char *value)
     return "generic";
 }
 
+static const char *normalize_output_mqtt_component(const char *value)
+{
+    if (value && strcmp(value, "number") == 0) {
+        return "number";
+    }
+    if (value && strcmp(value, "light") == 0) {
+        return "light";
+    }
+    if (value && strcmp(value, "cover") == 0) {
+        return "cover";
+    }
+    return "auto";
+}
+
+static const char *normalize_output_mqtt_number_mode(const char *value)
+{
+    if (value && strcmp(value, "box") == 0) {
+        return "box";
+    }
+    if (value && strcmp(value, "auto") == 0) {
+        return "auto";
+    }
+    return "slider";
+}
+
 static bool is_adc_feedback_gpio(int gpio)
 {
     return gpio == 0 || gpio == 1 || gpio == 2 || gpio == 3 || gpio == 4;
@@ -366,6 +403,76 @@ static bool reserve_gpio(cfg_validation_t *ctx, int gpio, const char *owner, con
 
     set_error("GPIO%d conflict between %s and %s", gpio, owner, slot->owner);
     return false;
+}
+
+static bool reserve_ledc_channel(cfg_validation_t *ctx, const char *owner, int freq_hz)
+{
+    int timer_index = -1;
+
+    if (!ctx || !owner || freq_hz <= 0) {
+        set_error("Invalid LEDC reservation request");
+        return false;
+    }
+
+    for (int i = 0; i < ctx->ledc_timer_count; ++i) {
+        if (ctx->ledc_timers[i].used && ctx->ledc_timers[i].freq_hz == freq_hz) {
+            timer_index = i;
+            break;
+        }
+    }
+
+    if (timer_index < 0) {
+        if (ctx->ledc_timer_count >= SOC_LEDC_TIMER_NUM) {
+            set_error("%s requires too many LEDC timers/frequencies: max %d", owner, SOC_LEDC_TIMER_NUM);
+            return false;
+        }
+        timer_index = ctx->ledc_timer_count++;
+        ctx->ledc_timers[timer_index].used = true;
+        ctx->ledc_timers[timer_index].freq_hz = freq_hz;
+    }
+
+    if (ctx->ledc_channel_count >= SOC_LEDC_CHANNEL_NUM) {
+        set_error("%s requires too many LEDC channels: max %d", owner, SOC_LEDC_CHANNEL_NUM);
+        return false;
+    }
+
+    ctx->ledc_channel_count++;
+    return true;
+}
+
+static int rmt_blocks_for_symbols(int mem_block_symbols)
+{
+    int blocks = mem_block_symbols / SOC_RMT_MEM_WORDS_PER_CHANNEL;
+    if (blocks * SOC_RMT_MEM_WORDS_PER_CHANNEL < mem_block_symbols) {
+        blocks++;
+    }
+    return blocks;
+}
+
+static bool reserve_rmt_blocks(cfg_validation_t *ctx, const char *owner, int tx_blocks, int rx_blocks)
+{
+    const int max_tx_blocks = (int)(SOC_RMT_GROUPS * SOC_RMT_TX_CANDIDATES_PER_GROUP);
+    const int max_rx_blocks = (int)(SOC_RMT_GROUPS * SOC_RMT_RX_CANDIDATES_PER_GROUP);
+
+    if (!ctx || !owner || tx_blocks < 0 || rx_blocks < 0) {
+        set_error("Invalid RMT reservation request");
+        return false;
+    }
+
+    if (ctx->rmt_tx_blocks_used + tx_blocks > max_tx_blocks) {
+        set_error("%s exceeds available RMT TX blocks: need %d more, max %d",
+                  owner, tx_blocks, max_tx_blocks);
+        return false;
+    }
+    if (ctx->rmt_rx_blocks_used + rx_blocks > max_rx_blocks) {
+        set_error("%s exceeds available RMT RX blocks: need %d more, max %d",
+                  owner, rx_blocks, max_rx_blocks);
+        return false;
+    }
+
+    ctx->rmt_tx_blocks_used += tx_blocks;
+    ctx->rmt_rx_blocks_used += rx_blocks;
+    return true;
 }
 
 static cJSON *create_empty_schema(void)
@@ -582,10 +689,11 @@ static cJSON *normalize_config(const cJSON *src)
             }
 
             cJSON *dst = cJSON_CreateObject();
+            bool enabled = jbool(item, "enabled", true);
             cJSON_AddStringToObject(dst, "id", id);
             cJSON_AddStringToObject(dst, "name", jstr(item, "name", id));
             cJSON_AddStringToObject(dst, "type", type);
-            cJSON_AddBoolToObject(dst, "enabled", jbool(item, "enabled", true));
+            cJSON_AddBoolToObject(dst, "enabled", enabled);
             cJSON_AddNumberToObject(dst, "gpio", gpio);
 
             if (strcmp(type, "relay") == 0) {
@@ -622,6 +730,13 @@ static cJSON *normalize_config(const cJSON *src)
                         return normalize_cleanup_and_fail(root, ctx);
                     }
                 }
+                if (enabled) {
+                    char ledc_owner[40] = {0};
+                    snprintf(ledc_owner, sizeof(ledc_owner), "pwm:%s", id);
+                    if (!reserve_ledc_channel(ctx, ledc_owner, freq)) {
+                        return normalize_cleanup_and_fail(root, ctx);
+                    }
+                }
                 cJSON_AddNumberToObject(dst, "freq_hz", freq);
                 cJSON_AddBoolToObject(dst, "inverted", jbool(item, "inverted", false));
                 cJSON_AddNumberToObject(dst, "default_level", default_level);
@@ -652,6 +767,13 @@ static cJSON *normalize_config(const cJSON *src)
                 if (!is_valid_ws2812_color_order(color_order)) {
                     color_order = "GRB";
                 }
+                if (enabled) {
+                    char rmt_owner[40] = {0};
+                    snprintf(rmt_owner, sizeof(rmt_owner), "ws2812:%s", id);
+                    if (!reserve_rmt_blocks(ctx, rmt_owner, 1, 0)) {
+                        return normalize_cleanup_and_fail(root, ctx);
+                    }
+                }
                 cJSON_AddNumberToObject(dst, "pixel_count", pixel_count);
                 cJSON_AddStringToObject(dst, "mode", mode);
                 cJSON_AddStringToObject(dst, "color_order", color_order);
@@ -663,6 +785,11 @@ static cJSON *normalize_config(const cJSON *src)
                 int default_level = jint(item, "default_level", 0);
                 int min_us = jint(item, "min_us", 500);
                 int max_us = jint(item, "max_us", 2500);
+                int hold_power_ms = jint(item, "hold_power_ms", SERVO_3WIRE_HOLD_MS_DEFAULT);
+                bool reverse_direction = jbool(item, "reverse_direction", false);
+                const char *mqtt_component = normalize_output_mqtt_component(jstr(item, "mqtt_component", "auto"));
+                const char *mqtt_number_mode =
+                    normalize_output_mqtt_number_mode(jstr(item, "mqtt_number_mode", "slider"));
                 if (default_level < 0) {
                     default_level = 0;
                 }
@@ -678,9 +805,26 @@ static cJSON *normalize_config(const cJSON *src)
                 if (max_us <= min_us) {
                     max_us = min_us + 100;
                 }
+                if (hold_power_ms < 0) {
+                    hold_power_ms = 0;
+                }
+                if (hold_power_ms > 10000) {
+                    hold_power_ms = 10000;
+                }
+                if (enabled) {
+                    char ledc_owner[40] = {0};
+                    snprintf(ledc_owner, sizeof(ledc_owner), "servo3:%s", id);
+                    if (!reserve_ledc_channel(ctx, ledc_owner, 50)) {
+                        return normalize_cleanup_and_fail(root, ctx);
+                    }
+                }
                 cJSON_AddNumberToObject(dst, "default_level", default_level);
                 cJSON_AddNumberToObject(dst, "min_us", min_us);
                 cJSON_AddNumberToObject(dst, "max_us", max_us);
+                cJSON_AddNumberToObject(dst, "hold_power_ms", hold_power_ms);
+                cJSON_AddBoolToObject(dst, "reverse_direction", reverse_direction);
+                cJSON_AddStringToObject(dst, "mqtt_component", mqtt_component);
+                cJSON_AddStringToObject(dst, "mqtt_number_mode", mqtt_number_mode);
             } else if (strcmp(type, "servo_5wire") == 0) {
                 int gpio_b = jint(item, "gpio_b", -1);
                 int feedback_gpio = jint(item, "feedback_gpio", -1);
@@ -689,6 +833,9 @@ static cJSON *normalize_config(const cJSON *src)
                 int feedback_max_raw = jint(item, "feedback_max_raw", 3700);
                 int deadband_pct = jint(item, "deadband_pct", 2);
                 int move_timeout_ms = jint(item, "move_timeout_ms", 15000);
+                const char *mqtt_component = normalize_output_mqtt_component(jstr(item, "mqtt_component", "auto"));
+                const char *mqtt_number_mode =
+                    normalize_output_mqtt_number_mode(jstr(item, "mqtt_number_mode", "slider"));
 
                 char owner_b[40] = {0};
                 char owner_fb[40] = {0};
@@ -736,6 +883,8 @@ static cJSON *normalize_config(const cJSON *src)
                 cJSON_AddNumberToObject(dst, "deadband_pct", deadband_pct);
                 cJSON_AddNumberToObject(dst, "move_timeout_ms", move_timeout_ms);
                 cJSON_AddBoolToObject(dst, "reverse_direction", jbool(item, "reverse_direction", false));
+                cJSON_AddStringToObject(dst, "mqtt_component", mqtt_component);
+                cJSON_AddStringToObject(dst, "mqtt_number_mode", mqtt_number_mode);
             } else if (strcmp(type, "clock_4x4094") == 0) {
                 int gpio_b = jint(item, "gpio_b", -1);
                 int gpio_c = jint(item, "gpio_c", -1);
@@ -769,6 +918,13 @@ static cJSON *normalize_config(const cJSON *src)
                 }
                 if (brightness_gpio >= 0 && !reserve_gpio(ctx, brightness_gpio, owner_pwm, "")) {
                     return normalize_cleanup_and_fail(root, ctx);
+                }
+                if (enabled && brightness_gpio >= 0) {
+                    char ledc_owner[40] = {0};
+                    snprintf(ledc_owner, sizeof(ledc_owner), "clock4094:%s", id);
+                    if (!reserve_ledc_channel(ctx, ledc_owner, 1000)) {
+                        return normalize_cleanup_and_fail(root, ctx);
+                    }
                 }
 
                 if (timezone_offset_min < -720) {
@@ -1153,6 +1309,13 @@ static cJSON *normalize_config(const cJSON *src)
                 }
                 ctx->onewire_seen = true;
                 ctx->onewire_gpio = gpio;
+                if (jbool(item, "enabled", true)) {
+                    char rmt_owner[40] = {0};
+                    snprintf(rmt_owner, sizeof(rmt_owner), "ds18b20:%s", id);
+                    if (!reserve_rmt_blocks(ctx, rmt_owner, 1, rmt_blocks_for_symbols(10 * 8))) {
+                        return normalize_cleanup_and_fail(root, ctx);
+                    }
+                }
 
                 cJSON_AddNumberToObject(dst, "gpio", gpio);
                 cJSON_AddNumberToObject(dst, "poll_interval_sec", jint(item, "poll_interval_sec", 30));

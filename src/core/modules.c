@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,7 @@
 #include "i2c_bus.h"
 #include "led_strip.h"
 #include "onewire_bus.h"
+#include "soc/soc_caps.h"
 #include "sht3x.h"
 
 #include "app_watchdog.h"
@@ -36,6 +38,7 @@ static const char *TAG = "modules";
 #define MODULES_MAX_DS18B20 8
 #define MODULES_POLL_PERIOD_MS 50
 #define MODULES_SENSOR_TASK_PERIOD_MS 200
+#define SERVO_3WIRE_HOLD_MS_DEFAULT 1200
 #define MODULES_DEFAULT_I2C_PORT I2C_NUM_0
 #define LEVEL_PCT_MAX 100
 #define WS2812_BRIGHTNESS_MAX 255
@@ -88,6 +91,8 @@ typedef struct {
     char id[24];
     char name[40];
     char role[16];
+    char mqtt_component[16];
+    char mqtt_number_mode[16];
     int gpio;
     bool power;
     bool supported;
@@ -147,6 +152,9 @@ typedef struct {
             int level;
             int min_us;
             int max_us;
+            bool reverse_direction;
+            int hold_power_ms;
+            int64_t release_at_us;
             ledc_channel_t channel;
             ledc_timer_t timer;
         } servo_3wire;
@@ -322,6 +330,19 @@ typedef struct {
 } adc_runtime_t;
 
 typedef struct {
+    bool used;
+    int freq_hz;
+    ledc_timer_bit_t duty_resolution;
+    ledc_timer_t timer;
+} ledc_timer_allocation_t;
+
+typedef struct {
+    ledc_timer_allocation_t timers[SOC_LEDC_TIMER_NUM];
+    int timer_count;
+    int next_channel;
+} ledc_allocator_t;
+
+typedef struct {
     output_runtime_t outputs[MODULES_MAX_OUTPUTS];
     int output_count;
     input_runtime_t inputs[MODULES_MAX_INPUTS];
@@ -336,11 +357,25 @@ typedef struct {
 } modules_runtime_t;
 
 static modules_runtime_t s_runtime = {0};
+static char s_last_error[192] = "";
 static SemaphoreHandle_t s_lock = NULL;
 static TaskHandle_t s_poll_task = NULL;
 static TaskHandle_t s_sensor_task = NULL;
 static modules_runtime_callback_t s_runtime_cb = NULL;
 static void *s_runtime_cb_ctx = NULL;
+
+static void set_last_error(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_last_error, sizeof(s_last_error), fmt, ap);
+    va_end(ap);
+}
+
+static void clear_last_error(void)
+{
+    s_last_error[0] = 0;
+}
 
 static const cJSON *jobj(const cJSON *obj, const char *key);
 static const char *jstr(const cJSON *obj, const char *key, const char *def);
@@ -375,7 +410,10 @@ static esp_err_t ensure_i2c_bus_locked(int sda_gpio, int scl_gpio, int freq_hz);
 static esp_err_t ensure_ds18b20_bus_locked(const sensor_runtime_t *sensor);
 static esp_err_t ensure_adc_channel_locked(int gpio, adc_channel_t *out_channel);
 static esp_err_t read_sensor_locked(sensor_runtime_t *sensor);
-static esp_err_t read_ds18b20_locked(void);
+static const char *normalize_output_mqtt_component(const char *value);
+static const char *normalize_output_mqtt_number_mode(const char *value);
+static esp_err_t enumerate_ds18b20_devices_locked(int gpio, bool *out_topology_changed);
+static esp_err_t read_ds18b20_locked(bool *out_topology_changed);
 static esp_err_t set_pwm_power_relay_locked(output_runtime_t *out, bool on);
 static bool output_supports_power_control(const output_runtime_t *out);
 static bool output_supports_level_control(const output_runtime_t *out);
@@ -384,6 +422,7 @@ static const char *cover_state_text_locked(const output_runtime_t *out);
 static esp_err_t servo_5wire_set_drive_locked(output_runtime_t *out, int logical_direction);
 static int servo_5wire_feedback_to_level_locked(const output_runtime_t *out, int raw);
 static esp_err_t servo_5wire_read_feedback_locked(output_runtime_t *out, int *out_raw, int *out_level);
+static bool update_servo_3wire_release_locked(output_runtime_t *out, int64_t now_us);
 static bool update_servo_5wire_control_locked(output_runtime_t *out, int64_t now_us);
 static int stepper_level_to_position(int level, int steps_range);
 static int stepper_position_to_level(int position_steps, int steps_range);
@@ -401,11 +440,19 @@ static esp_err_t stepper_a4988_start_home_locked(output_runtime_t *out);
 static esp_err_t stepper_a4988_stop_locked(output_runtime_t *out);
 static bool update_stepper_28byj_control_locked(output_runtime_t *out, int64_t now_us);
 static bool update_stepper_a4988_control_locked(output_runtime_t *out, int64_t now_us);
+
+const char *modules_last_error(void)
+{
+    return s_last_error[0] ? s_last_error : "unknown module error";
+}
 static esp_err_t clock_4x4094_apply_state_locked(output_runtime_t *out, int64_t now_us, bool force_render);
 static bool update_clock_4x4094_locked(output_runtime_t *out, int64_t now_us);
 static esp_err_t render_ws2812_frame_locked(output_runtime_t *out, int level, uint8_t red, uint8_t green, uint8_t blue, int wipe_active_segments);
 static esp_err_t apply_ws2812_target_locked(output_runtime_t *out, bool allow_transition);
 static void update_ws2812_transitions_locked(int64_t now_us);
+static bool output_uses_plain_gpio(output_type_t type);
+static esp_err_t ledc_allocator_acquire(ledc_allocator_t *alloc, int freq_hz, ledc_timer_bit_t duty_resolution,
+                                        ledc_channel_t *out_channel, ledc_timer_t *out_timer);
 
 static const cJSON *jobj(const cJSON *obj, const char *key)
 {
@@ -510,6 +557,31 @@ static const char *output_type_to_text(output_type_t type)
     }
 }
 
+static const char *normalize_output_mqtt_component(const char *value)
+{
+    if (value && strcmp(value, "number") == 0) {
+        return "number";
+    }
+    if (value && strcmp(value, "light") == 0) {
+        return "light";
+    }
+    if (value && strcmp(value, "cover") == 0) {
+        return "cover";
+    }
+    return "auto";
+}
+
+static const char *normalize_output_mqtt_number_mode(const char *value)
+{
+    if (value && strcmp(value, "box") == 0) {
+        return "box";
+    }
+    if (value && strcmp(value, "auto") == 0) {
+        return "auto";
+    }
+    return "slider";
+}
+
 static ws2812_mode_t ws2812_mode_from_text(const char *mode)
 {
     if (strcmp(mode, "mono_triplet") == 0) {
@@ -593,6 +665,53 @@ static void notify_runtime_changed(void)
     if (s_runtime_cb) {
         s_runtime_cb(s_runtime_cb_ctx);
     }
+}
+
+static bool output_uses_plain_gpio(output_type_t type)
+{
+    return type == OUTPUT_TYPE_RELAY ||
+           type == OUTPUT_TYPE_SERVO_5WIRE ||
+           type == OUTPUT_TYPE_CLOCK_4X4094 ||
+           type == OUTPUT_TYPE_STEPPER_28BYJ ||
+           type == OUTPUT_TYPE_STEPPER_A4988;
+}
+
+static esp_err_t ledc_allocator_acquire(ledc_allocator_t *alloc, int freq_hz, ledc_timer_bit_t duty_resolution,
+                                        ledc_channel_t *out_channel, ledc_timer_t *out_timer)
+{
+    int timer_index = -1;
+
+    if (!alloc || !out_channel || !out_timer || freq_hz <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (int i = 0; i < alloc->timer_count; ++i) {
+        if (alloc->timers[i].used &&
+            alloc->timers[i].freq_hz == freq_hz &&
+            alloc->timers[i].duty_resolution == duty_resolution) {
+            timer_index = i;
+            break;
+        }
+    }
+
+    if (timer_index < 0) {
+        if (alloc->timer_count >= SOC_LEDC_TIMER_NUM) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        timer_index = alloc->timer_count++;
+        alloc->timers[timer_index].used = true;
+        alloc->timers[timer_index].freq_hz = freq_hz;
+        alloc->timers[timer_index].duty_resolution = duty_resolution;
+        alloc->timers[timer_index].timer = (ledc_timer_t)timer_index;
+    }
+
+    if (alloc->next_channel >= SOC_LEDC_CHANNEL_NUM) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    *out_channel = (ledc_channel_t)alloc->next_channel++;
+    *out_timer = alloc->timers[timer_index].timer;
+    return ESP_OK;
 }
 
 static bool output_supports_power_control(const output_runtime_t *out)
@@ -1062,6 +1181,32 @@ static esp_err_t servo_5wire_read_feedback_locked(output_runtime_t *out, int *ou
         *out_level = out->cfg.servo_5wire.current_level;
     }
     return ESP_OK;
+}
+
+static bool update_servo_3wire_release_locked(output_runtime_t *out, int64_t now_us)
+{
+    esp_err_t err;
+
+    if (!out || out->type != OUTPUT_TYPE_SERVO_3WIRE || !out->enabled || !out->supported) {
+        return false;
+    }
+    if (!out->power || out->test_active) {
+        return false;
+    }
+    if (out->cfg.servo_3wire.hold_power_ms <= 0 || out->cfg.servo_3wire.release_at_us <= 0) {
+        return false;
+    }
+    if (now_us < out->cfg.servo_3wire.release_at_us) {
+        return false;
+    }
+
+    out->cfg.servo_3wire.release_at_us = 0;
+    out->power = false;
+    err = ledc_stop(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "servo release failed for %s: %s", out->id, esp_err_to_name(err));
+    }
+    return true;
 }
 
 static bool update_servo_5wire_control_locked(output_runtime_t *out, int64_t now_us)
@@ -2019,18 +2164,34 @@ static esp_err_t output_apply_physical_state(output_runtime_t *out)
             uint32_t duty;
             const uint32_t max_duty = (1U << LEDC_TIMER_13_BIT) - 1U;
 
+            if (!out->power) {
+                out->cfg.servo_3wire.release_at_us = 0;
+                return ledc_stop(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel, 0);
+            }
             if (level < 0) {
                 level = 0;
             }
             if (level > 100) {
                 level = 100;
             }
+            if (out->cfg.servo_3wire.reverse_direction) {
+                level = 100 - level;
+            }
 
             pulse_us = out->cfg.servo_3wire.min_us +
                        (int)(((int64_t)(out->cfg.servo_3wire.max_us - out->cfg.servo_3wire.min_us) * level) / 100LL);
             duty = (uint32_t)(((int64_t)pulse_us * (int64_t)max_duty) / 20000LL);
-            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel, duty));
-            return ledc_update_duty(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel);
+            ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel, duty),
+                                TAG, "servo duty set failed for %s", out->id);
+            ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, out->cfg.servo_3wire.channel),
+                                TAG, "servo duty update failed for %s", out->id);
+            if (out->cfg.servo_3wire.hold_power_ms > 0) {
+                out->cfg.servo_3wire.release_at_us =
+                    esp_timer_get_time() + ((int64_t)out->cfg.servo_3wire.hold_power_ms * 1000LL);
+            } else {
+                out->cfg.servo_3wire.release_at_us = 0;
+            }
+            return ESP_OK;
         }
         case OUTPUT_TYPE_SERVO_5WIRE:
             return servo_5wire_set_drive_locked(out, 0);
@@ -2418,7 +2579,7 @@ static void clear_runtime_locked(void)
     memset(&s_runtime, 0, sizeof(s_runtime));
 }
 
-static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int index)
+static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, ledc_allocator_t *ledc_alloc)
 {
     memset(out, 0, sizeof(*out));
     out->used = true;
@@ -2429,19 +2590,25 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
     snprintf(out->id, sizeof(out->id), "%s", jstr(item, "id", ""));
     snprintf(out->name, sizeof(out->name), "%s", jstr(item, "name", out->id));
     snprintf(out->role, sizeof(out->role), "%s", jstr(item, "role", "generic"));
+    snprintf(out->mqtt_component, sizeof(out->mqtt_component), "%s",
+             normalize_output_mqtt_component(jstr(item, "mqtt_component", "auto")));
+    snprintf(out->mqtt_number_mode, sizeof(out->mqtt_number_mode), "%s",
+             normalize_output_mqtt_number_mode(jstr(item, "mqtt_number_mode", "slider")));
 
     if (!out->enabled) {
         return ESP_OK;
     }
 
-    gpio_config_t io = {
-        .pin_bit_mask = 1ULL << out->gpio,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io));
+    if (output_uses_plain_gpio(out->type)) {
+        gpio_config_t io = {
+            .pin_bit_mask = 1ULL << out->gpio,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "gpio setup failed for %s", out->id);
+    }
 
     if (out->type == OUTPUT_TYPE_RELAY) {
         out->cfg.relay.active_level = jint(item, "active_level", 1) ? 1 : 0;
@@ -2463,8 +2630,9 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         }
         out->cfg.pwm.power_relay_gpio = jint(item, "power_relay_gpio", -1);
         out->cfg.pwm.power_relay_active_level = jint(item, "power_relay_active_level", 1) ? 1 : 0;
-        out->cfg.pwm.channel = (ledc_channel_t)index;
-        out->cfg.pwm.timer = (ledc_timer_t)(index % 4);
+        ESP_RETURN_ON_ERROR(ledc_allocator_acquire(ledc_alloc, out->cfg.pwm.freq_hz, LEDC_TIMER_13_BIT,
+                                                   &out->cfg.pwm.channel, &out->cfg.pwm.timer),
+                            TAG, "LEDC exhausted for PWM output %s", out->id);
         out->power = out->cfg.pwm.level > 0;
 
         ledc_timer_config_t timer_cfg = {
@@ -2474,7 +2642,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .freq_hz = out->cfg.pwm.freq_hz,
             .clk_cfg = LEDC_AUTO_CLK,
         };
-        ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+        ESP_RETURN_ON_ERROR(ledc_timer_config(&timer_cfg), TAG, "LEDC timer config failed for %s", out->id);
 
         ledc_channel_config_t chan_cfg = {
             .gpio_num = out->gpio,
@@ -2485,7 +2653,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .duty = 0,
             .hpoint = 0,
         };
-        ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
+        ESP_RETURN_ON_ERROR(ledc_channel_config(&chan_cfg), TAG, "LEDC channel config failed for %s", out->id);
 
         if (out->cfg.pwm.power_relay_gpio >= 0) {
             gpio_config_t relay_io = {
@@ -2495,8 +2663,8 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
                 .pull_down_en = GPIO_PULLDOWN_DISABLE,
                 .intr_type = GPIO_INTR_DISABLE,
             };
-            ESP_ERROR_CHECK(gpio_config(&relay_io));
-            ESP_ERROR_CHECK(set_pwm_power_relay_locked(out, false));
+            ESP_RETURN_ON_ERROR(gpio_config(&relay_io), TAG, "PWM relay gpio setup failed for %s", out->id);
+            ESP_RETURN_ON_ERROR(set_pwm_power_relay_locked(out, false), TAG, "PWM relay init failed for %s", out->id);
         }
         return output_apply_physical_state(out);
     }
@@ -2505,6 +2673,8 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         out->cfg.servo_3wire.level = jint(item, "default_level", 0);
         out->cfg.servo_3wire.min_us = jint(item, "min_us", 500);
         out->cfg.servo_3wire.max_us = jint(item, "max_us", 2500);
+        out->cfg.servo_3wire.reverse_direction = jbool(item, "reverse_direction", false);
+        out->cfg.servo_3wire.hold_power_ms = jint(item, "hold_power_ms", SERVO_3WIRE_HOLD_MS_DEFAULT);
         if (out->cfg.servo_3wire.level < 0) {
             out->cfg.servo_3wire.level = 0;
         }
@@ -2520,9 +2690,17 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         if (out->cfg.servo_3wire.max_us <= out->cfg.servo_3wire.min_us) {
             out->cfg.servo_3wire.max_us = out->cfg.servo_3wire.min_us + 100;
         }
+        if (out->cfg.servo_3wire.hold_power_ms < 0) {
+            out->cfg.servo_3wire.hold_power_ms = 0;
+        }
+        if (out->cfg.servo_3wire.hold_power_ms > 10000) {
+            out->cfg.servo_3wire.hold_power_ms = 10000;
+        }
+        out->cfg.servo_3wire.release_at_us = 0;
 
-        out->cfg.servo_3wire.channel = (ledc_channel_t)index;
-        out->cfg.servo_3wire.timer = (ledc_timer_t)(index % 4);
+        ESP_RETURN_ON_ERROR(ledc_allocator_acquire(ledc_alloc, 50, LEDC_TIMER_13_BIT,
+                                                   &out->cfg.servo_3wire.channel, &out->cfg.servo_3wire.timer),
+                            TAG, "LEDC exhausted for servo output %s", out->id);
         out->power = true;
 
         ledc_timer_config_t timer_cfg = {
@@ -2532,7 +2710,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .freq_hz = 50,
             .clk_cfg = LEDC_AUTO_CLK,
         };
-        ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+        ESP_RETURN_ON_ERROR(ledc_timer_config(&timer_cfg), TAG, "LEDC timer config failed for %s", out->id);
 
         ledc_channel_config_t chan_cfg = {
             .gpio_num = out->gpio,
@@ -2543,7 +2721,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .duty = 0,
             .hpoint = 0,
         };
-        ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
+        ESP_RETURN_ON_ERROR(ledc_channel_config(&chan_cfg), TAG, "LEDC channel config failed for %s", out->id);
         return output_apply_physical_state(out);
     }
 
@@ -2587,12 +2765,13 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
         };
-        ESP_ERROR_CHECK(gpio_config(&io_b));
-        ESP_ERROR_CHECK(ensure_adc_channel_locked(out->cfg.servo_5wire.feedback_gpio,
-                                                 &out->cfg.servo_5wire.adc_channel));
+        ESP_RETURN_ON_ERROR(gpio_config(&io_b), TAG, "servo gpio setup failed for %s", out->id);
+        ESP_RETURN_ON_ERROR(ensure_adc_channel_locked(out->cfg.servo_5wire.feedback_gpio,
+                                                     &out->cfg.servo_5wire.adc_channel),
+                            TAG, "servo adc setup failed for %s", out->id);
         out->supported = true;
         out->power = false;
-        ESP_ERROR_CHECK(servo_5wire_set_drive_locked(out, 0));
+        ESP_RETURN_ON_ERROR(servo_5wire_set_drive_locked(out, 0), TAG, "servo init failed for %s", out->id);
         (void)update_servo_5wire_control_locked(out, esp_timer_get_time());
         return ESP_OK;
     }
@@ -2618,8 +2797,6 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         out->cfg.clock_4x4094.reverse_digits = jbool(item, "reverse_digits", false);
         out->cfg.clock_4x4094.leading_zero = jbool(item, "leading_zero", true);
         out->cfg.clock_4x4094.blink_separator = jbool(item, "blink_separator", true);
-        out->cfg.clock_4x4094.channel = (ledc_channel_t)index;
-        out->cfg.clock_4x4094.timer = (ledc_timer_t)(index % 4);
         out->cfg.clock_4x4094.time_valid = false;
         out->cfg.clock_4x4094.separator_on = false;
         out->cfg.clock_4x4094.display_hour = -1;
@@ -2663,10 +2840,13 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
         };
-        ESP_ERROR_CHECK(gpio_config(&extra_io));
-        ESP_ERROR_CHECK(gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_b, 0));
-        ESP_ERROR_CHECK(gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_c, 0));
+        ESP_RETURN_ON_ERROR(gpio_config(&extra_io), TAG, "clock gpio setup failed for %s", out->id);
+        ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_b, 0), TAG, "clock clk init failed for %s", out->id);
+        ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->cfg.clock_4x4094.gpio_c, 0), TAG, "clock latch init failed for %s", out->id);
         if (out->cfg.clock_4x4094.brightness_gpio >= 0) {
+            ESP_RETURN_ON_ERROR(ledc_allocator_acquire(ledc_alloc, 1000, LEDC_TIMER_13_BIT,
+                                                       &out->cfg.clock_4x4094.channel, &out->cfg.clock_4x4094.timer),
+                                TAG, "LEDC exhausted for clock output %s", out->id);
             ledc_timer_config_t timer_cfg = {
                 .speed_mode = LEDC_LOW_SPEED_MODE,
                 .timer_num = out->cfg.clock_4x4094.timer,
@@ -2674,7 +2854,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
                 .freq_hz = 1000,
                 .clk_cfg = LEDC_AUTO_CLK,
             };
-            ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+            ESP_RETURN_ON_ERROR(ledc_timer_config(&timer_cfg), TAG, "clock LEDC timer config failed for %s", out->id);
 
             ledc_channel_config_t chan_cfg = {
                 .gpio_num = out->cfg.clock_4x4094.brightness_gpio,
@@ -2685,7 +2865,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
                 .duty = 0,
                 .hpoint = 0,
             };
-            ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
+            ESP_RETURN_ON_ERROR(ledc_channel_config(&chan_cfg), TAG, "clock LEDC channel config failed for %s", out->id);
         }
         out->power = out->cfg.clock_4x4094.default_on && out->cfg.clock_4x4094.level > 0;
         return output_apply_physical_state(out);
@@ -2748,7 +2928,7 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
         };
-        ESP_ERROR_CHECK(gpio_config(&extra_io));
+        ESP_RETURN_ON_ERROR(gpio_config(&extra_io), TAG, "stepper gpio setup failed for %s", out->id);
         if (out->cfg.stepper_28byj.home_gpio >= 0) {
             gpio_config_t home_io = {
                 .pin_bit_mask = 1ULL << out->cfg.stepper_28byj.home_gpio,
@@ -2757,21 +2937,22 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
                 .pull_down_en = (out->cfg.stepper_28byj.home_pull_mode == GPIO_PULLDOWN_ONLY) ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
                 .intr_type = GPIO_INTR_DISABLE,
             };
-            ESP_ERROR_CHECK(gpio_config(&home_io));
+            ESP_RETURN_ON_ERROR(gpio_config(&home_io), TAG, "stepper home gpio setup failed for %s", out->id);
             if (stepper_28byj_home_active_locked(out)) {
                 stepper_28byj_finish_home_locked(out);
                 return ESP_OK;
             }
             if (out->cfg.stepper_28byj.auto_home_on_boot) {
-                ESP_ERROR_CHECK(stepper_28byj_start_home_locked(out));
+                ESP_RETURN_ON_ERROR(stepper_28byj_start_home_locked(out), TAG, "stepper home init failed for %s", out->id);
                 return ESP_OK;
             }
         }
         if (out->cfg.stepper_28byj.hold_enabled) {
-            ESP_ERROR_CHECK(stepper_28byj_apply_phase_locked(out, out->cfg.stepper_28byj.phase_index));
+            ESP_RETURN_ON_ERROR(stepper_28byj_apply_phase_locked(out, out->cfg.stepper_28byj.phase_index),
+                                TAG, "stepper hold init failed for %s", out->id);
             out->power = true;
         } else {
-            ESP_ERROR_CHECK(stepper_28byj_release_locked(out));
+            ESP_RETURN_ON_ERROR(stepper_28byj_release_locked(out), TAG, "stepper release init failed for %s", out->id);
             out->power = false;
         }
         return ESP_OK;
@@ -2839,8 +3020,8 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
         };
-        ESP_ERROR_CHECK(gpio_config(&extra_io));
-        ESP_ERROR_CHECK(gpio_set_level((gpio_num_t)out->gpio, 0));
+        ESP_RETURN_ON_ERROR(gpio_config(&extra_io), TAG, "A4988 gpio setup failed for %s", out->id);
+        ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)out->gpio, 0), TAG, "A4988 step gpio init failed for %s", out->id);
         if (out->cfg.stepper_a4988.home_gpio >= 0) {
             gpio_config_t home_io = {
                 .pin_bit_mask = 1ULL << out->cfg.stepper_a4988.home_gpio,
@@ -2849,21 +3030,21 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
                 .pull_down_en = (out->cfg.stepper_a4988.home_pull_mode == GPIO_PULLDOWN_ONLY) ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
                 .intr_type = GPIO_INTR_DISABLE,
             };
-            ESP_ERROR_CHECK(gpio_config(&home_io));
+            ESP_RETURN_ON_ERROR(gpio_config(&home_io), TAG, "A4988 home gpio setup failed for %s", out->id);
             if (stepper_a4988_home_active_locked(out)) {
                 stepper_a4988_finish_home_locked(out);
                 return ESP_OK;
             }
             if (out->cfg.stepper_a4988.auto_home_on_boot) {
-                ESP_ERROR_CHECK(stepper_a4988_start_home_locked(out));
+                ESP_RETURN_ON_ERROR(stepper_a4988_start_home_locked(out), TAG, "A4988 home init failed for %s", out->id);
                 return ESP_OK;
             }
         }
         if (out->cfg.stepper_a4988.hold_enabled) {
-            ESP_ERROR_CHECK(stepper_a4988_set_enable_locked(out, true));
+            ESP_RETURN_ON_ERROR(stepper_a4988_set_enable_locked(out, true), TAG, "A4988 enable init failed for %s", out->id);
             out->power = true;
         } else {
-            ESP_ERROR_CHECK(stepper_a4988_set_enable_locked(out, false));
+            ESP_RETURN_ON_ERROR(stepper_a4988_set_enable_locked(out, false), TAG, "A4988 disable init failed for %s", out->id);
             out->power = false;
         }
         return ESP_OK;
@@ -2908,12 +3089,14 @@ static esp_err_t configure_output(output_runtime_t *out, const cJSON *item, int 
         led_strip_rmt_config_t rmt_cfg = {
             .clk_src = RMT_CLK_SRC_DEFAULT,
             .resolution_hz = 10 * 1000 * 1000,
-            .mem_block_symbols = 64,
+            // Keep WS2812 within one C3 RMT TX block so DS18B20 can still allocate its 1-Wire TX channel.
+            .mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL,
             .flags = {
                 .with_dma = false,
             },
         };
-        ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &out->cfg.ws2812.strip));
+        ESP_RETURN_ON_ERROR(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &out->cfg.ws2812.strip),
+                            TAG, "WS2812 init failed for %s", out->id);
         out->supported = true;
         return render_ws2812_frame_locked(out, out->cfg.ws2812.applied_level,
                                           out->cfg.ws2812.applied_red,
@@ -3057,23 +3240,67 @@ static esp_err_t ensure_ds18b20_bus_locked(const sensor_runtime_t *sensor)
     snprintf(s_runtime.ds18b20.sensor_id, sizeof(s_runtime.ds18b20.sensor_id), "%s", sensor->id);
     snprintf(s_runtime.ds18b20.sensor_name, sizeof(s_runtime.ds18b20.sensor_name), "%s", sensor->name);
 
-    onewire_device_iter_handle_t iter = NULL;
-    ESP_RETURN_ON_ERROR(onewire_new_device_iter(s_runtime.ds18b20.bus, &iter), TAG, "create 1-wire iterator failed");
+    return enumerate_ds18b20_devices_locked(sensor->gpio, NULL);
+}
 
+static esp_err_t enumerate_ds18b20_devices_locked(int gpio, bool *out_topology_changed)
+{
+    ds18b20_device_handle_t new_devices[MODULES_MAX_DS18B20] = {0};
+    uint64_t new_addresses[MODULES_MAX_DS18B20] = {0};
+    onewire_device_iter_handle_t iter = NULL;
     onewire_device_t dev = {0};
-    int count = 0;
-    while (count < MODULES_MAX_DS18B20 && onewire_device_iter_get_next(iter, &dev) == ESP_OK) {
+    int new_count = 0;
+    bool topology_changed = false;
+
+    if (out_topology_changed) {
+        *out_topology_changed = false;
+    }
+    if (!s_runtime.ds18b20.bus) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_RETURN_ON_ERROR(onewire_new_device_iter(s_runtime.ds18b20.bus, &iter), TAG, "create 1-wire iterator failed");
+    while (new_count < MODULES_MAX_DS18B20 && onewire_device_iter_get_next(iter, &dev) == ESP_OK) {
         ds18b20_config_t ds_cfg = {};
-        if (ds18b20_new_device_from_enumeration(&dev, &ds_cfg, &s_runtime.ds18b20.devices[count]) == ESP_OK) {
-            (void)ds18b20_set_resolution(s_runtime.ds18b20.devices[count], DS18B20_RESOLUTION_12B);
-            s_runtime.ds18b20.addresses[count] = dev.address;
-            s_runtime.ds18b20.valid[count] = false;
-            count++;
+        if (ds18b20_new_device_from_enumeration(&dev, &ds_cfg, &new_devices[new_count]) == ESP_OK) {
+            (void)ds18b20_set_resolution(new_devices[new_count], DS18B20_RESOLUTION_12B);
+            new_addresses[new_count] = dev.address;
+            new_count++;
         }
     }
     (void)onewire_del_device_iter(iter);
-    s_runtime.ds18b20.device_count = count;
-    ESP_LOGI(TAG, "Discovered %d DS18B20 device(s) on GPIO%d", count, sensor->gpio);
+
+    if (new_count != s_runtime.ds18b20.device_count) {
+        topology_changed = true;
+    } else {
+        for (int i = 0; i < new_count; ++i) {
+            if (new_addresses[i] != s_runtime.ds18b20.addresses[i]) {
+                topology_changed = true;
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < s_runtime.ds18b20.device_count; ++i) {
+        if (s_runtime.ds18b20.devices[i]) {
+            (void)ds18b20_del_device(s_runtime.ds18b20.devices[i]);
+        }
+    }
+    memset(s_runtime.ds18b20.devices, 0, sizeof(s_runtime.ds18b20.devices));
+    memset(s_runtime.ds18b20.addresses, 0, sizeof(s_runtime.ds18b20.addresses));
+    memset(s_runtime.ds18b20.valid, 0, sizeof(s_runtime.ds18b20.valid));
+    memset(s_runtime.ds18b20.temperatures, 0, sizeof(s_runtime.ds18b20.temperatures));
+
+    for (int i = 0; i < new_count; ++i) {
+        s_runtime.ds18b20.devices[i] = new_devices[i];
+        s_runtime.ds18b20.addresses[i] = new_addresses[i];
+    }
+    s_runtime.ds18b20.device_count = new_count;
+    if (out_topology_changed) {
+        *out_topology_changed = topology_changed;
+    }
+
+    ESP_LOGI(TAG, "Discovered %d DS18B20 device(s) on GPIO%d", new_count, gpio);
     return ESP_OK;
 }
 
@@ -3245,10 +3472,24 @@ static esp_err_t read_sensor_locked(sensor_runtime_t *sensor)
     return ESP_ERR_NOT_SUPPORTED;
 }
 
-static esp_err_t read_ds18b20_locked(void)
+static esp_err_t read_ds18b20_locked(bool *out_topology_changed)
 {
+    if (out_topology_changed) {
+        *out_topology_changed = false;
+    }
     if (!s_runtime.ds18b20.active || !s_runtime.ds18b20.bus) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (s_runtime.ds18b20.device_count == 0) {
+        bool topology_changed = false;
+        ESP_RETURN_ON_ERROR(enumerate_ds18b20_devices_locked(s_runtime.ds18b20.gpio, &topology_changed),
+                            TAG, "ds18 bus rescan failed");
+        if (out_topology_changed) {
+            *out_topology_changed = topology_changed;
+        }
+        if (s_runtime.ds18b20.device_count == 0) {
+            return ESP_ERR_NOT_FOUND;
+        }
     }
 
     app_watchdog_reset_current_task("modules_sensor");
@@ -3294,6 +3535,15 @@ static void modules_poll_task(void *arg)
                 continue;
             }
             if (update_servo_5wire_control_locked(out, now_us)) {
+                changed = true;
+            }
+        }
+        for (int i = 0; i < s_runtime.output_count; ++i) {
+            output_runtime_t *out = &s_runtime.outputs[i];
+            if (!out->used || !out->enabled || out->type != OUTPUT_TYPE_SERVO_3WIRE) {
+                continue;
+            }
+            if (update_servo_3wire_release_locked(out, now_us)) {
                 changed = true;
             }
         }
@@ -3384,7 +3634,8 @@ static void modules_sensor_task(void *arg)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         if (s_runtime.ds18b20.active &&
             (s_runtime.ds18b20.next_poll_us == 0 || now_us >= s_runtime.ds18b20.next_poll_us)) {
-            if (read_ds18b20_locked() == ESP_OK) {
+            bool topology_changed = false;
+            if (read_ds18b20_locked(&topology_changed) == ESP_OK || topology_changed) {
                 changed = true;
             }
             s_runtime.ds18b20.next_poll_us = esp_timer_get_time() +
@@ -3454,6 +3705,14 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
     if (out->role[0]) {
         cJSON_AddStringToObject(obj, "role", out->role);
     }
+    if ((out->type == OUTPUT_TYPE_SERVO_3WIRE || out->type == OUTPUT_TYPE_SERVO_5WIRE) &&
+        out->mqtt_component[0]) {
+        cJSON_AddStringToObject(obj, "mqtt_component", out->mqtt_component);
+    }
+    if ((out->type == OUTPUT_TYPE_SERVO_3WIRE || out->type == OUTPUT_TYPE_SERVO_5WIRE) &&
+        out->mqtt_number_mode[0]) {
+        cJSON_AddStringToObject(obj, "mqtt_number_mode", out->mqtt_number_mode);
+    }
     cJSON_AddBoolToObject(obj, "enabled", out->enabled);
     cJSON_AddBoolToObject(obj, "supported", out->supported);
     cJSON_AddNumberToObject(obj, "gpio", out->gpio);
@@ -3491,6 +3750,8 @@ static cJSON *build_output_status_json(const output_runtime_t *out)
         cJSON_AddNumberToObject(obj, "level", out->cfg.servo_3wire.level);
         cJSON_AddNumberToObject(obj, "min_us", out->cfg.servo_3wire.min_us);
         cJSON_AddNumberToObject(obj, "max_us", out->cfg.servo_3wire.max_us);
+        cJSON_AddNumberToObject(obj, "hold_power_ms", out->cfg.servo_3wire.hold_power_ms);
+        cJSON_AddBoolToObject(obj, "reverse_direction", out->cfg.servo_3wire.reverse_direction);
     } else if (out->type == OUTPUT_TYPE_SERVO_5WIRE) {
         cJSON_AddNumberToObject(obj, "level", out->cfg.servo_5wire.current_level);
         cJSON_AddNumberToObject(obj, "target_level", out->cfg.servo_5wire.target_level);
@@ -3703,10 +3964,14 @@ esp_err_t modules_init(void)
 
 esp_err_t modules_apply_config(const cJSON *cfg)
 {
+    esp_err_t err = ESP_OK;
+
     if (!cfg) {
+        set_last_error("Configuration is null");
         return ESP_ERR_INVALID_ARG;
     }
 
+    clear_last_error();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     clear_runtime_locked();
 
@@ -3714,6 +3979,7 @@ esp_err_t modules_apply_config(const cJSON *cfg)
     const cJSON *inputs = jobj(cfg, "inputs");
     const cJSON *buttons = jobj(cfg, "buttons");
     const cJSON *sensors = jobj(cfg, "sensors");
+    ledc_allocator_t ledc_alloc = {0};
 
     if (cJSON_IsArray((cJSON *)outputs)) {
         s_runtime.output_count = cJSON_GetArraySize((cJSON *)outputs);
@@ -3721,7 +3987,16 @@ esp_err_t modules_apply_config(const cJSON *cfg)
             s_runtime.output_count = MODULES_MAX_OUTPUTS;
         }
         for (int i = 0; i < s_runtime.output_count; ++i) {
-            ESP_ERROR_CHECK(configure_output(&s_runtime.outputs[i], cJSON_GetArrayItem((cJSON *)outputs, i), i));
+            err = configure_output(&s_runtime.outputs[i], cJSON_GetArrayItem((cJSON *)outputs, i), &ledc_alloc);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to configure output %d (%s): %s", i,
+                         s_runtime.outputs[i].id[0] ? s_runtime.outputs[i].id : "<unnamed>",
+                         esp_err_to_name(err));
+                set_last_error("output %s: %s",
+                               s_runtime.outputs[i].id[0] ? s_runtime.outputs[i].id : "<unnamed>",
+                               esp_err_to_name(err));
+                goto fail;
+            }
         }
     }
 
@@ -3731,7 +4006,16 @@ esp_err_t modules_apply_config(const cJSON *cfg)
             s_runtime.input_count = MODULES_MAX_INPUTS;
         }
         for (int i = 0; i < s_runtime.input_count; ++i) {
-            ESP_ERROR_CHECK(configure_input(&s_runtime.inputs[i], cJSON_GetArrayItem((cJSON *)inputs, i)));
+            err = configure_input(&s_runtime.inputs[i], cJSON_GetArrayItem((cJSON *)inputs, i));
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to configure input %d (%s): %s", i,
+                         s_runtime.inputs[i].id[0] ? s_runtime.inputs[i].id : "<unnamed>",
+                         esp_err_to_name(err));
+                set_last_error("input %s: %s",
+                               s_runtime.inputs[i].id[0] ? s_runtime.inputs[i].id : "<unnamed>",
+                               esp_err_to_name(err));
+                goto fail;
+            }
         }
     }
 
@@ -3741,7 +4025,16 @@ esp_err_t modules_apply_config(const cJSON *cfg)
             s_runtime.button_count = MODULES_MAX_BUTTONS;
         }
         for (int i = 0; i < s_runtime.button_count; ++i) {
-            ESP_ERROR_CHECK(configure_button(&s_runtime.buttons[i], cJSON_GetArrayItem((cJSON *)buttons, i)));
+            err = configure_button(&s_runtime.buttons[i], cJSON_GetArrayItem((cJSON *)buttons, i));
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to configure button %d (%s): %s", i,
+                         s_runtime.buttons[i].id[0] ? s_runtime.buttons[i].id : "<unnamed>",
+                         esp_err_to_name(err));
+                set_last_error("button %s: %s",
+                               s_runtime.buttons[i].id[0] ? s_runtime.buttons[i].id : "<unnamed>",
+                               esp_err_to_name(err));
+                goto fail;
+            }
         }
     }
 
@@ -3751,7 +4044,16 @@ esp_err_t modules_apply_config(const cJSON *cfg)
             s_runtime.sensor_count = MODULES_MAX_SENSORS;
         }
         for (int i = 0; i < s_runtime.sensor_count; ++i) {
-            ESP_ERROR_CHECK(configure_sensor(&s_runtime.sensors[i], cJSON_GetArrayItem((cJSON *)sensors, i)));
+            err = configure_sensor(&s_runtime.sensors[i], cJSON_GetArrayItem((cJSON *)sensors, i));
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to configure sensor %d (%s): %s", i,
+                         s_runtime.sensors[i].id[0] ? s_runtime.sensors[i].id : "<unnamed>",
+                         esp_err_to_name(err));
+                set_last_error("sensor %s: %s",
+                               s_runtime.sensors[i].id[0] ? s_runtime.sensors[i].id : "<unnamed>",
+                               esp_err_to_name(err));
+                goto fail;
+            }
         }
     }
 
@@ -3760,6 +4062,11 @@ esp_err_t modules_apply_config(const cJSON *cfg)
     ESP_LOGI(TAG, "Applied runtime config: outputs=%d inputs=%d buttons=%d sensors=%d",
              s_runtime.output_count, s_runtime.input_count, s_runtime.button_count, s_runtime.sensor_count);
     return ESP_OK;
+
+fail:
+    clear_runtime_locked();
+    xSemaphoreGive(s_lock);
+    return err;
 }
 
 cJSON *modules_build_status_json(void)
@@ -3838,6 +4145,18 @@ esp_err_t modules_action(const char *id, const cJSON *action, cJSON **out_respon
                     err = stepper_28byj_stop_locked(out);
                 } else if (out->type == OUTPUT_TYPE_STEPPER_A4988) {
                     err = stepper_a4988_stop_locked(out);
+                } else if (out->type == OUTPUT_TYPE_SERVO_3WIRE) {
+                    out->cfg.servo_3wire.release_at_us = 0;
+                    err = set_output_power_locked(out, false);
+                } else if (out->type == OUTPUT_TYPE_SERVO_5WIRE) {
+                    err = servo_5wire_set_drive_locked(out, 0);
+                    if (err == ESP_OK) {
+                        out->cfg.servo_5wire.target_level = out->cfg.servo_5wire.current_level;
+                        out->cfg.servo_5wire.moving = false;
+                        out->cfg.servo_5wire.timed_out = false;
+                        out->cfg.servo_5wire.drive_started_us = 0;
+                        out->power = false;
+                    }
                 } else {
                     err = ESP_ERR_NOT_SUPPORTED;
                 }
@@ -3849,6 +4168,7 @@ esp_err_t modules_action(const char *id, const cJSON *action, cJSON **out_respon
                 const cJSON *set_brightness = jobj(action, "set_brightness");
                 const cJSON *color = jobj(action, "color");
                 bool handled = false;
+                err = ESP_OK;
 
                 if (cJSON_IsBool(set)) {
                     err = set_output_power_locked(out, cJSON_IsTrue(set));

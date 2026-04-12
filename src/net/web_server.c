@@ -327,7 +327,8 @@ static esp_err_t handle_apply(httpd_req_t *req)
 
     esp_err_t err = modules_apply_config(cfg_json_get());
     if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply failed");
+        system_log_writef("web", "error", "Runtime apply failed: %s", modules_last_error());
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, modules_last_error());
     }
     err = schedule_apply_from_current_cfg();
     if (err != ESP_OK) {
